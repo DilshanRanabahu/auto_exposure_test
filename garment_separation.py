@@ -36,8 +36,8 @@ Read-only and free of app.py, the camera and the files on disk.
 
 from dataclasses import dataclass, field
 
-import cv2
-import numpy as np
+import cv2 # type: ignore
+import numpy as np # type: ignore
 
 import logging
 get_logger = logging.getLogger

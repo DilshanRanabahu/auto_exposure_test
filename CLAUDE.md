@@ -34,31 +34,50 @@ light garment into it.
 | File | What it is |
 |---|---|
 | `garment_separation.py` | Copy of `scanner-app/core/camera/auto_exposure/garment_separation.py`. Only change: `core.shared.logger` replaced by `logging`. |
-| `capture.py` | Copy of `scanner-app/core/camera/capture.py`, same logger swap. Its `core.shared.paths` imports run only when no `calibration_file` is given; `live_test.py` always gives one. |
-| `live_test.py` | Live test: camera -> `PreProcessor` -> `separate_garment` -> contrast, in a window. |
-| `calibration.json` | Not here yet: copy it from the device (`~/configuration/calibration.json`). |
+| `capture.py` | Copy of `scanner-app/core/camera/capture.py`, same logger swap. Its `core.shared.paths` imports run only when no `calibration_file` is given; `app.py` always gives one. |
+| `auto_exposure.py` | The auto exposure logic (sample logic v0, Risindu's format): `run_auto_exposure(cam, pre, calibration_file)`. Rules and step sizes are constants at the top. |
+| `app.py` | Runs it: camera -> `PreProcessor` -> `separate_garment` in a window, `a` runs auto exposure; `--once` runs it without a window. |
+| `calibration.json` | Copied from `C:\Users\prave\configuration\calibration.json` (crop for a 1638x3343 raw frame, `dist_coeffs` null). |
 
 **The scanner-app repo is the source of truth.** The two copies drift if either side changes: port a
 change made here back into `core/camera/auto_exposure/garment_separation.py` (keep the repo's logger import),
 and recopy after changing the repo.
 
-### live_test.py
+### app.py / auto_exposure.py
 
 ```bash
 sudo systemctl stop rms-app        # on a device: the camera can only be open in one process
-python3 live_test.py --calibration calibration.json                  # Daheng camera
-python3 live_test.py --camera webcam --calibration calibration.json  # USB webcam
-python3 live_test.py --camera image --image frame.jpg                # saved frame, no camera
+python3 app.py                                   # Daheng camera, window; a = auto exposure
+python3 app.py --camera webcam                   # USB webcam
+python3 app.py --camera image --image frame.jpg  # saved frame, exposure simulated (linear, gain in dB)
+python3 app.py --once                            # auto exposure once, no window
+python3 app.py --no-save                         # never write calibration.json
+python3 app.py --images <folder> --out <results>  # every image, from each --starts exposure (simulated)
 ```
 
-Keys: `+`/`-` exposure x/÷1.25 · `w` sweep · `s` save raw/processed/overlay to `captures/` · `q` quit.
-The sweep separates once at the current exposure (must be OK), then sets each of `SWEEP_US`
-(2000-40000 us), waits `SETTLE_S` + exposure time, measures contrast and garment clipping on the **same masks**,
-and keeps the exposure with the highest contrast whose garment is ≤1% at 255. Nothing is written to
-`calibration.json`.
+Keys: `a` auto exposure · `+`/`-` exposure x/÷1.25 · `s` save raw/processed/overlay to `captures/` · `q` quit.
 
-Only the image mode and the sweep logic (with a fake camera) were run; **it has not been run on a real
-camera yet**. Daheng frames come out of `capture.py` as RGB arrays (`convert("RGB")`), the app uses them as-is.
+Logic (`auto_exposure.py`, the user asked for **only contrast, exposure and brightness** in the steps):
+every round takes a new frame and separates again; any mask is used (valid or not) unless
+`segment_problem`: area outside 4-90%, or >15% of one frame side (those count as contrast 0).
+Steps: contrast 0-10 -> exposure +3000 / brightness +2, 10-20 -> +3000/+1, 20-40 -> +2000, 40-70 -> +1000,
+>70 STOP. Contrast fell -> back to the previous values and go down with the same steps; fell again -> STOP.
+Limits 2000-40000 us, brightness (gain) 0-20, max 8 rounds. `pick_best`: only segments ≥70% of the largest
+one (a print, a corner of the cloth or the desk is small and can have contrast 200); then the highest
+contrast if any is ≥15, else the highest solidity (area / convex hull: below 15 contrast says nothing,
+white briefs had their clean outline at contrast 1). Then exposure/gain go to calibration.json
+(`.tmp` + `os.replace`; not in image mode or with `--no-save`). A "garment brighter than the table" rule
+was tried and removed: it broke light garments on grey tables.
+
+Saved per run: `round<N>_<us>us.jpg`, `BEST_round<N>.jpg` (values written on it), `best.json`, `log.txt`.
+`--images`: one folder per garment, a subfolder per start, plus the garment's `BEST_<us>us.jpg`/`best.json`
+and `summary.txt`; the calibration crop is used only when the frame is `stage1_reference_resolution`.
+Latest run (`img/results/auto_exposure_v5`, images renamed `01_..25_`, map in `img/rename_map.csv`):
+22/25 right; wrong: 02, 03, 14 (1024 px overexposed white t-shirts, no outline in any round).
+
+`app.py` sets the camera's `last_config_mtime` after `start()` so `--exposure` is not overwritten by the
+file on the first frame, and converts Daheng RGB frames to BGR for the window and saved images only
+(separation gets the frame as the scanner app does). Only image mode was run; **not run on a real camera yet**.
 
 ## How the separation works (`separate_garment(image, px_per_mm=None)`)
 
@@ -126,7 +145,7 @@ its border is table. `OpenCVWebcamCapture` converts µs to V4L2 (100 µs units) 
 
 ## Next steps (only when the user asks)
 
-1. Run `live_test.py` on a device and record contrast versus exposure for dark, light and white garments.
+1. Run `app.py` on a device and record contrast versus exposure for dark, light and white garments.
 2. The exposure loop: contrast alone is not the target. It rises with exposure until the table clips at
    255, then falls for light garments. Aim for the highest contrast with the garment unclipped (≤1% at 255),
    preferably with the table not clipped either. Change exposure before gain (gain adds noise). Drop 2-3 frames
