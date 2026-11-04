@@ -1,0 +1,140 @@
+{
+    "unit": "inch",
+    "rotation_angle": 0,
+    "crop_bbox": [
+        [
+            52,
+            36
+        ],
+        [
+            1638,
+            3343
+        ]
+    ],
+    "stage1_reference_resolution": [
+        1638,
+        3343
+    ],
+    "calibration_resolution": [
+        1586,
+        3307
+    ],
+    "two_point_thickness_mm": 2.0,
+    "charuco": {
+        "dictionary": "DICT_6X6_250",
+        "squares_x": 10,
+        "squares_y": 7,
+        "square_length_mm": 35,
+        "marker_length_mm": 26
+    },
+    "marker_pose": {
+        "dictionary": "DICT_6X6_250",
+        "grid_rows": 7,
+        "grid_cols": 10,
+        "spacing_x_mm": 70,
+        "spacing_y_mm": 70,
+        "start_id": 0,
+        "marker_length_mm": 26,
+        "min_visible_markers": 4,
+        "reprojection_error_threshold": 5
+    },
+    "calibration_method": "charuco",
+    "calibration_saved_by": "User A",
+    "gain": 13.0,
+    "exposure": 39594.0,
+    "use_stored_pose_for_measurements": true,
+    "last_updated": "2026-10-30T17:17:41.069141",
+    "last_updated_by": "User A",
+    "board_thickness_mm": 3.0,
+    "camera_matrix": [
+        [
+            3420.43136584922,
+            0,
+            432.7714525530722
+        ],
+        [
+            0,
+            3413.5102277083456,
+            1735.6383894551152
+        ],
+        [
+            0,
+            0,
+            1
+        ]
+    ],
+    "dist_coeffs": null,
+    "undistorted_camera_matrix": [
+        [
+            3435.66261248674,
+            0.0,
+            414.6809322869959
+        ],
+        [
+            0.0,
+            3458.5455393926313,
+            1741.4198924886816
+        ],
+        [
+            0.0,
+            0.0,
+            1.0
+        ]
+    ],
+    "calibration_images_used": 13,
+    "calibration_timestamp": "2026-09-29T15:24:06.834676",
+    "reprojection_error_px": 0.36885182198635874,
+    "per_image_reprojection_errors": [
+        0.4112617075443268,
+        0.3274279832839966,
+        0.3183671534061432,
+        0.3351711630821228,
+        0.2713392674922943,
+        0.22252723574638367,
+        0.3851407766342163,
+        0.4538733959197998,
+        0.40900442004203796,
+        0.5955016016960144,
+        0.3297059237957001,
+        0.3687560558319092,
+        0.366997092962265
+    ],
+    "calibration_outlier_images_rejected": 2,
+    "calibration_flags": "CALIB_STANDARD_MODEL",
+    "camera_rotation": [
+        [
+            -0.09057304091380328,
+            -0.9424748151137978,
+            0.3217728191377255
+        ],
+        [
+            0.9923004906856621,
+            -0.1128132249100959,
+            -0.05111665550853847
+        ],
+        [
+            0.08447638986498537,
+            0.31466553538892217,
+            0.9454360583317003
+        ]
+    ],
+    "camera_translation": [
+        [
+            229.6381610133669
+        ],
+        [
+            -149.84748494666073
+        ],
+        [
+            1073.9693196097899
+        ]
+    ],
+    "pose_timestamp": "2026-09-29T15:24:23.640281",
+    "pose_source": "charuco_stage3_manual",
+    "pose_reprojection_error_px": 1.9214154566337929,
+    "pose_visible_markers": 32,
+    "pose_charuco_corner_count": 45,
+    "pose_saved_by": "User A",
+    "a4_verification": null,
+    "calibration_completed": "2026-10-30T17:06:36.610773"
+}
