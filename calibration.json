@@ -1,25 +1,29 @@
 {
-    "unit": "inch",
+    "unit": "cm",
     "rotation_angle": 0,
     "crop_bbox": [
         [
-            52,
-            36
+            1000,
+            360
         ],
         [
-            1638,
-            3343
+            3720,
+            2100
         ]
     ],
     "stage1_reference_resolution": [
-        1638,
-        3343
+        4024,
+        3036
     ],
     "calibration_resolution": [
-        1586,
-        3307
+        2720,
+        1740
     ],
+    "calibration_saved_by": "User A",
+    "gain": 12.0,
+    "exposure": 25000.0,
     "two_point_thickness_mm": 2.0,
+    "last_updated": "2026-11-04T18:41:23.533572",
     "charuco": {
         "dictionary": "DICT_6X6_250",
         "squares_x": 10,
@@ -38,24 +42,21 @@
         "min_visible_markers": 4,
         "reprojection_error_threshold": 5
     },
-    "calibration_method": "charuco",
-    "calibration_saved_by": "User A",
-    "gain": 13.0,
-    "exposure": 39594.0,
-    "use_stored_pose_for_measurements": true,
-    "last_updated": "2026-10-30T17:17:41.069141",
     "last_updated_by": "User A",
+    "calibration_method": "charuco",
+    "use_stored_pose_for_measurements": true,
     "board_thickness_mm": 3.0,
+    "autofocus": false,
     "camera_matrix": [
         [
-            3420.43136584922,
+            3374.5874165787213,
             0,
-            432.7714525530722
+            1606.095971382194
         ],
         [
             0,
-            3413.5102277083456,
-            1735.6383894551152
+            3374.5874165787213,
+            1031.0809412904316
         ],
         [
             0,
@@ -66,14 +67,14 @@
     "dist_coeffs": null,
     "undistorted_camera_matrix": [
         [
-            3435.66261248674,
+            3358.2930841641105,
             0.0,
-            414.6809322869959
+            1611.0728425351433
         ],
         [
             0.0,
-            3458.5455393926313,
-            1741.4198924886816
+            3364.2880733740153,
+            1032.3542200642582
         ],
         [
             0.0,
@@ -81,60 +82,102 @@
             1.0
         ]
     ],
-    "calibration_images_used": 13,
-    "calibration_timestamp": "2026-09-29T15:24:06.834676",
-    "reprojection_error_px": 0.36885182198635874,
+    "calibration_images_used": 15,
+    "calibration_timestamp": "2026-10-30T18:14:50.320852",
+    "reprojection_error_px": 0.5122559030850729,
     "per_image_reprojection_errors": [
-        0.4112617075443268,
-        0.3274279832839966,
-        0.3183671534061432,
-        0.3351711630821228,
-        0.2713392674922943,
-        0.22252723574638367,
-        0.3851407766342163,
-        0.4538733959197998,
-        0.40900442004203796,
-        0.5955016016960144,
-        0.3297059237957001,
-        0.3687560558319092,
-        0.366997092962265
+        0.4312622845172882,
+        0.25575196743011475,
+        0.590900719165802,
+        0.5179816484451294,
+        0.3725721538066864,
+        0.6282921433448792,
+        0.5911798477172852,
+        0.4885740876197815,
+        0.6748227477073669,
+        0.4779474437236786,
+        0.410984069108963,
+        0.7920587062835693,
+        0.328914612531662,
+        0.6880166530609131,
+        0.434579461812973
     ],
-    "calibration_outlier_images_rejected": 2,
+    "calibration_outlier_images_rejected": 0,
+    "calibration_quality": {
+        "model": "desk_constrained",
+        "desk_refinement": {
+            "applied": true,
+            "desk_images": [
+                1,
+                2,
+                3,
+                4,
+                5,
+                6,
+                7,
+                8,
+                9
+            ],
+            "rms_px": 0.6509126349165197,
+            "free_rms_px": 0.5867905614414339,
+            "reason": null
+        },
+        "focal_aspect_ratio": 1.0,
+        "free_focal_aspect_ratio": 0.999473034909562,
+        "focal_std_px": [
+            15.815045409881954,
+            15.670439695706174
+        ],
+        "varied_views": 4,
+        "tilted_edges": [
+            "left",
+            "right",
+            "top",
+            "bottom"
+        ],
+        "coverage_gaps": [],
+        "rejected_images": [],
+        "rejection_reverted": false,
+        "warnings": [
+            "Only 4 image(s) show the board at a clearly different angle. Retake image 14: raise the board's top-left corner (as seen on screen) about 30-40 degrees. Retake image 15: raise the board's bottom-right corner (as seen on screen) about 30-40 degrees.",
+            "To retake an image, delete it in the Saved images list and press Capture: the guide shows the same shot again. Then run the Stage 2 calibration again."
+        ]
+    },
     "calibration_flags": "CALIB_STANDARD_MODEL",
     "camera_rotation": [
         [
-            -0.09057304091380328,
-            -0.9424748151137978,
-            0.3217728191377255
+            0.9991497895436243,
+            0.038783115482384084,
+            -0.013984563218467888
         ],
         [
-            0.9923004906856621,
-            -0.1128132249100959,
-            -0.05111665550853847
+            -0.041134117825409766,
+            0.9605906862512905,
+            -0.27490638013331026
         ],
         [
-            0.08447638986498537,
-            0.31466553538892217,
-            0.9454360583317003
+            0.002771715291398285,
+            0.27524789452556186,
+            0.9613692912474314
         ]
     ],
     "camera_translation": [
         [
-            229.6381610133669
+            -181.94283765876392
         ],
         [
-            -149.84748494666073
+            -185.25703425216653
         ],
         [
-            1073.9693196097899
+            1078.520279845868
         ]
     ],
-    "pose_timestamp": "2026-09-29T15:24:23.640281",
+    "pose_timestamp": "2026-10-30T18:15:33.650068",
     "pose_source": "charuco_stage3_manual",
-    "pose_reprojection_error_px": 1.9214154566337929,
-    "pose_visible_markers": 32,
-    "pose_charuco_corner_count": 45,
+    "pose_reprojection_error_px": 0.3684823975798979,
+    "pose_visible_markers": 35,
+    "pose_charuco_corner_count": 54,
     "pose_saved_by": "User A",
     "a4_verification": null,
-    "calibration_completed": "2026-10-30T17:06:36.610773"
+    "calibration_completed": "2026-10-30T18:15:48.997985"
 }

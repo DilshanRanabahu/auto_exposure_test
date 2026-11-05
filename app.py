@@ -1,6 +1,7 @@
 """Auto exposure test app: live camera view with the garment / table separation, and the auto exposure logic.
 
-    python app.py                                    # Daheng camera, calibration.json in this folder
+    python app.py                                    # Daheng camera: auto exposure first, then the live view
+    python app.py --no-auto                          # live view only, no auto exposure at start
     python app.py --camera webcam                    # USB webcam
     python app.py --camera image --image frame.jpg   # a saved frame, exposure simulated
     python app.py --once                             # run auto exposure once, no window, and exit
@@ -8,10 +9,11 @@
     python app.py --images C:/path/img --out C:/path/img/results/auto_exposure
                                                      # every image in a folder, exposure simulated
 
-Every run is saved: one folder per garment, a subfolder per run with an image of every round,
-BEST_round<N>.jpg (the best segment with its exposure, brightness and contrast written on it),
-best.json and log.txt. With --images each garment is run from every --starts exposure, one subfolder
-each, and the garment folder gets the best of them (BEST_<exposure>us.jpg, best.json).
+Every garment is run from each --starts exposure (default 5000, 10000, 20000, 39594 us) and saved
+the same way, live or from --images: <out>/<garment>/start_<us>us/ per start with an image of every
+round, BEST_round<N>.jpg, best.json and log.txt; the garment folder gets the best of all starts
+(BEST_<exposure>us.jpg, best.json); <out>/summary.txt gets one line per garment. Live, the garment
+folder is <out>/<--garment>_<time>/ and the camera is left at the best values.
 
 On a device stop the scanner app first: the camera can only be open in one process.
 
@@ -20,8 +22,11 @@ On a device stop the scanner app first: the camera can only be open in one proce
 The frame goes through the same steps as in the scanner app: camera -> PreProcessor (rotate, crop,
 undistort from calibration.json) -> separate_garment. The logic itself is in auto_exposure.py.
 
+With a camera, auto exposure runs once at start and the live view then shows the camera at the
+best exposure and brightness it found.
+
 Keys in the window:
-    a         run auto exposure (the rounds are printed in the console, saved to --out/live_<time>)
+    a         run auto exposure again (e.g. after changing the garment; saved to --out/live_<time>)
     +  /  -   exposure x1.25 / /1.25
     s         save the raw frame, the processed frame and the overlay to --out
     q / Esc   quit
@@ -33,12 +38,20 @@ import os
 import sys
 import time
 
+# OpenCV's Qt window looks for fonts in its own package and warns on every frame when there are
+# none ("QFontDatabase: Cannot find font directory"); point it at the system's fonts instead.
+if sys.platform.startswith('linux') and 'QT_QPA_FONTDIR' not in os.environ:
+    for _font_dir in ('/usr/share/fonts/truetype/dejavu', '/usr/share/fonts/truetype', '/usr/share/fonts'):
+        if os.path.isdir(_font_dir):
+            os.environ['QT_QPA_FONTDIR'] = _font_dir
+            break
+
 import cv2 # type: ignore
 import numpy as np # type: ignore
 
 import auto_exposure
 from auto_exposure import (DEFAULT_EXPOSURE_US, best_image, best_values, pick_best, run_auto_exposure,
-                           save_run)
+                           save_calibration, save_run)
 from capture import OpenCVWebcamCapture, PreProcessor, WebcamCapture
 from garment_separation import draw_overlay, separate_garment
 
@@ -126,6 +139,16 @@ def annotate(frame, res, cam, fps, to_bgr):
 IMAGE_TYPES = ('.jpg', '.jpeg', '.png', '.bmp')
 
 
+def say(message):
+    """A timestamped line in the terminal."""
+    print('[%s] %s' % (time.strftime('%H:%M:%S'), message), flush=True)
+
+
+def camera_values(cam):
+    return 'exposure %s us, brightness %s' % ('%g' % cam.exposure if cam.exposure else 'auto',
+                                              '%g' % cam.gain if cam.gain is not None else '-')
+
+
 def run_and_save(cam, pre, folder, calibration_file=None, rgb=False):
     """Run auto exposure, print it and save it to ``folder`` (see save_run)."""
     lines = []
@@ -134,9 +157,17 @@ def run_and_save(cam, pre, folder, calibration_file=None, rgb=False):
         print(message)
         lines.extend(str(message).splitlines())
 
+    say('auto exposure: starting at %s' % camera_values(cam))
     result = run_auto_exposure(cam, pre, calibration_file=calibration_file, log=log)
     save_run(result, folder, lines, rgb=rgb)
-    print('saved to %s' % folder)
+    print('-' * 100)
+    if result.best is None:
+        say('auto exposure: NO GARMENT FOUND, camera left at %s' % camera_values(cam))
+    else:
+        say('auto exposure: BEST %s, contrast %.0f, solidity %.2f (round %d, picked by %s)'
+            % (camera_values(cam), result.contrast, result.solidity, result.best.n, result.picked_by))
+    say('auto exposure: saved to %s' % folder)
+    print('-' * 100, flush=True)
     return result
 
 
@@ -157,6 +188,60 @@ def crop_fits(processor, frame):
     return int(x1) <= w and int(y1) <= h
 
 
+SUMMARY_HEADER = '%-40s | best exposure, brightness, contrast, solidity' % 'garment'
+
+
+def run_garment(cam, pre, name, garment_dir, starts, start_gain, rgb=False):
+    """Run auto exposure on one garment from every start exposure, as the local tests did.
+
+    Saved to ``garment_dir``: start_<us>us/ per start (every round's image, BEST_round<N>.jpg,
+    best.json, log.txt), and the best of all starts as BEST_<us>us.jpg and best.json. The camera is
+    left at the best exposure and brightness. Returns (summary line, best result or None).
+    """
+    bests = []
+    for start in starts:
+        cam.set_exposure(start)
+        if start_gain is not None and hasattr(cam, 'set_gain'):
+            cam.set_gain(start_gain)
+        print('\n=== %s: start %d us' % (name, start))
+        result = run_and_save(cam, pre, os.path.join(garment_dir, 'start_%dus' % start), rgb=rgb)
+        if result.best is not None:
+            bests.append((start, result))
+    print('=' * 100)
+    if not bests:
+        say('%s: NO GARMENT FOUND from any start' % name)
+        print('=' * 100, flush=True)
+        return '%-40s | no garment found from any start' % name[:40], None
+    best_round, _ = pick_best([r.best for _, r in bests])
+    start, result = next((s, r) for s, r in bests if r.best is best_round)
+    cam.set_exposure(result.exposure)
+    if result.brightness is not None and hasattr(cam, 'set_gain'):
+        cam.set_gain(result.brightness)
+    values = dict(best_values(result), start_exposure=start)
+    with open(os.path.join(garment_dir, 'best.json'), 'w') as f:
+        json.dump({'best': values, 'per_start': {'%d' % s: best_values(r) for s, r in bests}}, f, indent=4)
+    cv2.imwrite(os.path.join(garment_dir, 'BEST_%dus.jpg' % result.exposure),
+                best_image(result, rgb=rgb, title='BEST (start %d us)' % start))
+    brightness = '-' if result.brightness is None else '%g' % result.brightness
+    say('%s: BEST OF ALL STARTS exposure %d us, brightness %s, contrast %.0f, solidity %.2f (from start %d us)'
+        % (name, result.exposure, brightness, result.contrast, result.solidity, start))
+    say('%s: saved to %s' % (name, garment_dir))
+    print('=' * 100, flush=True)
+    line = '%-40s | %6d us | brightness %5s | contrast %4.0f | solidity %.2f | from start %d' % (
+        name[:40], result.exposure, brightness, result.contrast, result.solidity, start)
+    return line, result
+
+
+def append_summary(out, line):
+    """Add one garment's line to <out>/summary.txt (header written once)."""
+    path = os.path.join(out, 'summary.txt')
+    new = not os.path.exists(path)
+    with open(path, 'a') as f:
+        if new:
+            f.write(SUMMARY_HEADER + '\n')
+        f.write(line + '\n')
+
+
 def run_folder(args, processor):
     """--images: every image in the folder, from every start exposure, saved one folder per garment."""
     auto_exposure.SETTLE_S = 0                          # a saved frame needs no settling
@@ -166,34 +251,15 @@ def run_folder(args, processor):
     summary = []
     for path in paths:
         name = os.path.splitext(os.path.basename(path))[0]
-        garment_dir = os.path.join(args.out, name)
         cam = ImageCamera(path)
         use_crop = crop_fits(processor, cam.base)
         pre = processor.process_image if use_crop else (lambda f: f)
         print('\n##### %s (%s)' % (name, 'calibration crop' if use_crop else 'no crop: it does not fit this frame'))
-        bests = []
-        for start in starts:
-            cam.exposure, cam.gain = start, ImageCamera.BASE_GAIN
-            print('\n=== start %d us' % start)
-            result = run_and_save(cam, pre, os.path.join(garment_dir, 'start_%dus' % start))
-            if result.best is not None:
-                bests.append((start, result))
-        if not bests:
-            summary.append('%-40s | no garment found from any start' % name[:40])
-            continue
-        best_round, _ = pick_best([r.best for _, r in bests])
-        start, result = next((s, r) for s, r in bests if r.best is best_round)
-        values = dict(best_values(result), start_exposure=start)
-        with open(os.path.join(garment_dir, 'best.json'), 'w') as f:
-            json.dump({'best': values, 'per_start': {'%d' % s: best_values(r) for s, r in bests}}, f, indent=4)
-        cv2.imwrite(os.path.join(garment_dir, 'BEST_%dus.jpg' % result.exposure),
-                    best_image(result, title='BEST (start %d us)' % start))
-        summary.append('%-40s | %6d us | brightness %5s | contrast %4.0f | solidity %.2f | from start %d' % (
-            name[:40], result.exposure, '%g' % result.brightness, result.contrast, result.solidity, start))
-    header = '%-40s | best exposure, brightness, contrast, solidity' % 'garment'
+        line, _ = run_garment(cam, pre, name, os.path.join(args.out, name), starts, ImageCamera.BASE_GAIN)
+        summary.append(line)
     with open(os.path.join(args.out, 'summary.txt'), 'w') as f:
-        f.write('\n'.join([header] + summary) + '\n')
-    print('\n' + '\n'.join([header] + summary))
+        f.write('\n'.join([SUMMARY_HEADER] + summary) + '\n')
+    print('\n' + '\n'.join([SUMMARY_HEADER] + summary))
 
 
 def main():
@@ -202,12 +268,15 @@ def main():
     parser.add_argument('--image', help='frame to use with --camera image')
     parser.add_argument('--images', help='folder of saved frames: run every one, exposure simulated, and exit')
     parser.add_argument('--starts', default='5000,10000,20000,39594',
-                        help='--images: start exposures in us, comma separated')
+                        help='start exposures in us, comma separated: auto exposure runs once from each')
+    parser.add_argument('--garment', default='garment',
+                        help='name for the result folders: <out>/<garment>_<time>/ per auto exposure run')
     parser.add_argument('--index', type=int, default=0, help='webcam index')
     parser.add_argument('--calibration', default='calibration.json', help='calibration.json copied from the device')
     parser.add_argument('--exposure', type=float, help='start exposure in us (default: the calibration value)')
     parser.add_argument('--no-save', action='store_true', help='do not write the result to calibration.json')
     parser.add_argument('--once', action='store_true', help='run auto exposure once without a window, then exit')
+    parser.add_argument('--no-auto', action='store_true', help='do not run auto exposure when the live view starts')
     parser.add_argument('--out', default='captures', help='folder for the results and for frames saved with s')
     args = parser.parse_args()
     if args.camera == 'image' and not args.image:
@@ -216,10 +285,10 @@ def main():
     processor = None
     if os.path.exists(args.calibration):
         processor = PreProcessor(calibration_file=args.calibration)
-        pre = lambda f: None if f is None else processor.process_image(f)  # noqa: E731
+        pre = lambda f: None if f is None else processor.process_image(f)
     else:
         print('WARNING: %s not found: no rotate/crop/undistort, so the frame border is the room' % args.calibration)
-        pre = lambda f: f  # noqa: E731
+        pre = lambda f: f 
     if args.images:
         run_folder(args, processor)
         return
@@ -228,24 +297,43 @@ def main():
         else args.calibration
     to_bgr = args.camera == 'daheng'          # Daheng frames are RGB; only the display is converted
 
+    if processor is not None and processor.crop_bbox:
+        (x0, y0), (x1, y1) = processor.crop_bbox
+        say('calibration: %s, crop %dx%d at (%d, %d)' % (args.calibration, x1 - x0, y1 - y0, x0, y0))
     cam = open_camera(args)
     if args.exposure:
         cam.set_exposure(args.exposure)
+    say('camera: %s started, %s' % (args.camera, camera_values(cam)))
+    if save_to is None:
+        say('calibration.json will not be written (%s)' % ('--no-save' if args.no_save else 'no camera / no file'))
+
+    starts = [float(v) for v in args.starts.split(',')]
+    start_gain = cam.gain
+
     def auto():
-        name = os.path.splitext(os.path.basename(args.image))[0] if args.camera == 'image' else 'live'
-        run_and_save(cam, pre, os.path.join(args.out, '%s_%s' % (name, time.strftime('%Y%m%d_%H%M%S'))),
-                     calibration_file=save_to, rgb=to_bgr)
+        """One garment: auto exposure from every start, saved like the local tests, best value kept."""
+        name = '%s_%s' % (args.garment, time.strftime('%Y%m%d_%H%M%S'))
+        say('%s: auto exposure from %d start exposures (%s us)' % (name, len(starts), args.starts))
+        line, result = run_garment(cam, pre, name, os.path.join(args.out, name), starts, start_gain, rgb=to_bgr)
+        append_summary(args.out, line)
+        if result is not None and save_to:
+            save_calibration(save_to, result.exposure, result.brightness)
+            say('%s: exposure and brightness written to %s' % (name, save_to))
 
     try:
         if args.once:
             auto()
             return
         os.makedirs(args.out, exist_ok=True)
+        if not args.no_auto:
+            auto()
+        say('live view: %s. Keys (click the window first): a = auto exposure again, +/- = exposure, '
+            's = save frame, q = quit' % camera_values(cam))
         fps, last = 0.0, time.time()
         while True:
             raw = wait_frame(cam)
             if raw is None:
-                print('no frame from the camera')
+                say('no frame from the camera')
                 continue
             frame = pre(raw)
             res = separate_garment(frame)
@@ -256,21 +344,25 @@ def main():
 
             key = cv2.waitKey(1) & 0xFF
             if key in (ord('q'), 27):
+                say('quit')
                 break
             current = cam.exposure or DEFAULT_EXPOSURE_US        # a webcam left on its own auto has none
             if key == ord('a'):
                 auto()
+                say('live view: %s' % camera_values(cam))
             elif key in (ord('+'), ord('=')):
                 cam.set_exposure(min(EXPOSURE_MAX_US, int(current * EXPOSURE_STEP)))
+                say('manual: %s' % camera_values(cam))
             elif key == ord('-'):
                 cam.set_exposure(max(EXPOSURE_MIN_US, int(current / EXPOSURE_STEP)))
+                say('manual: %s' % camera_values(cam))
             elif key == ord('s'):
                 stamp = time.strftime('%Y%m%d_%H%M%S')
                 save = (lambda f: cv2.cvtColor(f, cv2.COLOR_RGB2BGR)) if to_bgr else (lambda f: f)
                 cv2.imwrite(os.path.join(args.out, f'{stamp}_raw.jpg'), save(raw))
                 cv2.imwrite(os.path.join(args.out, f'{stamp}_processed.jpg'), save(frame))
                 cv2.imwrite(os.path.join(args.out, f'{stamp}_overlay.jpg'), draw_overlay(save(frame), res))
-                print('saved %s_* (exposure %s us, gain %s)' % (stamp, cam.exposure, cam.gain))
+                say('saved %s/%s_raw.jpg, _processed.jpg, _overlay.jpg (%s)' % (args.out, stamp, camera_values(cam)))
     finally:
         cam.stop()
         cv2.destroyAllWindows()

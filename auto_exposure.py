@@ -221,7 +221,7 @@ def run_auto_exposure(cam, pre=lambda f: f, calibration_file=None, log=print):
     result = AutoExposureResult()
     rounds = result.rounds
 
-    log('\n round | exposure_us | brightness | contrast | segment| action')
+    log('\n round | exposure_us | brightness | contrast | %-44s | action' % 'segment')
     direction = +1                  # +1 going up, -1 going down
     previous = None                 # the round the last step started from
     stop = None
