@@ -244,7 +244,8 @@ def append_summary(out, line):
 
 def run_folder(args, processor):
     """--images: every image in the folder, from every start exposure, saved one folder per garment."""
-    auto_exposure.SETTLE_S = 0                          # a saved frame needs no settling
+    auto_exposure.SETTLE_S = 0                          # a saved frame needs no settling...
+    auto_exposure.DROP_FRAMES = 0                       # ...and has no old frames in flight
     starts = [float(v) for v in args.starts.split(',')]
     paths = sorted(os.path.join(args.images, f) for f in os.listdir(args.images)
                    if f.lower().endswith(IMAGE_TYPES))

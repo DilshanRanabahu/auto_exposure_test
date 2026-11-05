@@ -60,6 +60,7 @@ DEFAULT_EXPOSURE_US = 20000     # the camera class default when calibration.json
 MAX_ROUNDS = 8
 MIN_SHARE_OF_LARGEST = 0.70     # pick_best: a segment smaller than this share of the largest one is a piece
 SETTLE_S = 0.2                  # after a change, frames already in the pipe still carry the old exposure
+DROP_FRAMES = 3                 # ...so this many new frames after the change are skipped as well
 
 # (contrast below, exposure step us, brightness step); contrast at or above the last row stops.
 CONTRAST_STEPS = [
@@ -185,15 +186,26 @@ class _Camera:
             self.cam.set_gain(brightness)
 
     def frame(self, timeout=5.0):
-        """A processed frame taken after the last change."""
+        """A processed frame taken after the last change.
+
+        The frame held when the change was made, and DROP_FRAMES more after it, are skipped: on the
+        Daheng camera they still carried the old exposure. Waiting 0.2 s alone was not enough: a round
+        set to 5000 us measured a 25000 us frame (contrast 106 instead of 21), stopped at once and left
+        the camera dark. A new frame is a new array object (the capture thread replaces it; a webcam
+        or a saved image returns a new one on every call).
+        """
         time.sleep(SETTLE_S + self.exposure / 1e6)
         end = time.time() + timeout
+        last, seen = None, 0
         while time.time() < end:
-            raw = self.cam.get_latest_image()
-            if raw is not None:
-                return self.pre(raw)
-            time.sleep(0.02)
-        return None
+            raw = self.cam.get_latest_image(copy=False)
+            if raw is not None and raw is not last:
+                last, seen = raw, seen + 1
+                if seen > DROP_FRAMES:
+                    return self.pre(raw.copy())
+            else:
+                time.sleep(0.005)
+        return None if last is None else self.pre(last.copy())
 
 
 def _clamp(value, low, high):
