@@ -16,9 +16,9 @@ The pipeline works on a copy scaled to ~1000 px on the long side:
 3. **Cue B, texture** and **cue C, closed edges.** A white garment on a white table can match
    it in brightness; what remains is its weave, seams and outline.
 4. **Cascade.** Cue A alone is tried first and kept when the result is plausible and has real
-   contrast against its ring. When the band's noise shows it is not just table (room, objects
-   or the garment itself in it), cue A is tried again with a two-class (Otsu) split of the whole
-   frame in place of the band model. Only then are B and C added. All three together from the
+   contrast against its ring. When it fails, cue A is tried again with a two-class (Otsu) split
+   of the whole frame in place of the band model (needed when the band is not just table, and
+   when uneven light joins the garment to a darker part of the table). Only then are B and C added. All three together from the
    start bloated the mask: the texture and edge cues also fire on creases in a table cloth, which
    spread a trouser mask across the table on a test frame where cue A alone was exact.
 5. **Pick the garment.** The largest object, preferring one that does not touch the frame
@@ -425,9 +425,10 @@ def separate_garment(image, px_per_mm=None):
     cue_b = cv2.erode(cue_b, _ellipse(TEXTURE_SPREAD_PX))
     cue_c = closed_edge_regions(smooth)
 
-    attempts = [('A', cue_a, None)]
-    if sigma > MAX_TABLE_NOISE:
-        attempts.append(('A-otsu', *two_class_objects(smooth, band)))
+    # The two-class split is tried whenever cue A fails, not only when the band is noisy: a dark brief
+    # on a clean band (noise 2.5) joined a darker strip of table along the right side under cue A's
+    # low threshold and ran off the frame edge, while the split found it alone.
+    attempts = [('A', cue_a, None), ('A-otsu', *two_class_objects(smooth, band))]
     attempts.append(('A+B+C', cv2.bitwise_or(cv2.bitwise_or(cue_a, cue_b), cue_c), None))
     for cue, objects, table_class in attempts:
         garment, ring, problems, stats = _evaluate(objects, gray, long_side, work_px_per_mm,

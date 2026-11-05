@@ -33,8 +33,8 @@ import os
 import sys
 import time
 
-import cv2
-import numpy as np
+import cv2 # type: ignore
+import numpy as np # type: ignore
 
 import auto_exposure
 from auto_exposure import (DEFAULT_EXPOSURE_US, best_image, best_values, pick_best, run_auto_exposure,
