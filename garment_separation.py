@@ -251,7 +251,7 @@ def closed_edge_regions(gray):
     return cv2.erode(fill_holes(edges), _ellipse(EDGE_GROW_PX))
 
 
-def select_garment(objects, long_side):
+def select_garment(objects, long_side, edge_ok=False):
     """Largest object (preferring one off the frame border) plus large pieces close to it, holes filled.
 
     The order of preference is: objects off the border of at least MIN_CANDIDATE_FRAC, then smaller
@@ -259,6 +259,10 @@ def select_garment(objects, long_side):
     sheet whose outline came out only as small pieces (collar line, print): once the size floor removed
     them, a mouse whose cable ran off the frame edge was the only object left and was picked. A piece
     of the shirt is the better wrong answer, and still fails the area check in ``_evaluate``.
+
+    ``edge_ok``: the frame is cropped to the table, so nothing along its sides can be the room. Objects
+    along the sides are kept and compete by size with the rest: a long-sleeved shirt larger than the
+    crop ran off three sides and was dropped as the room, leaving its seam lines as the garment.
 
     Returns (mask or None, note).
     """
@@ -276,7 +280,7 @@ def select_garment(objects, long_side):
             if not touches:
                 small_inner.append((area, i, False))
             continue
-        if touches:
+        if touches and not edge_ok:
             # A tight crop clips a trouser waist or hem along a short stretch of one side (11% on a
             # test frame); the room or the desk's far edge runs along most of it. Without this, once
             # the size floor above removed a white shirt's print fragments, the dark room strip along
@@ -289,14 +293,14 @@ def select_garment(objects, long_side):
     if not candidates and not small_inner:
         return None, 'no object found on the table'
 
-    inner = [c for c in candidates if not c[2]] or small_inner
+    inner = (candidates if edge_ok else [c for c in candidates if not c[2]]) or small_inner
     _, pick, _ = max(inner or candidates)
     note = '' if inner else 'garment touches the frame border'
     garment = (labels == pick).astype(np.uint8) * 255
 
     near = cv2.dilate(garment, _ellipse(max(3, MERGE_DIST_FRAC * long_side)))
     for _, i, touches in candidates:
-        if i != pick and not touches and np.any(near[labels == i]):
+        if i != pick and (edge_ok or not touches) and np.any(near[labels == i]):
             garment[labels == i] = 255
     # A small close only: a large one bridged the gap under a sleeve and filled the armpits.
     garment = cv2.morphologyEx(garment, cv2.MORPH_CLOSE, _ellipse(3))
@@ -309,7 +313,7 @@ def _ring_geometry(long_side, px_per_mm):
     return max(2, int(RING_GAP_FRAC * long_side)), max(4, int(RING_WIDTH_FRAC * long_side))
 
 
-def _evaluate(objects, gray, long_side, px_per_mm, detach=False, table_class=None, trusted=True):
+def _evaluate(objects, gray, long_side, px_per_mm, detach=False, table_class=None, trusted=True, edge_ok=False):
     """Turn one cue's object mask into (garment, ring, problems, stats) at working size.
 
     ``detach`` picks the garment on an eroded copy and grows it back inside the objects, so a
@@ -321,18 +325,20 @@ def _evaluate(objects, gray, long_side, px_per_mm, detach=False, table_class=Non
     ``table_class`` (two-class path) is the mask the ring must mostly lie on. ``trusted`` is False when
     the band model is not just table; a mostly clipped garment is then rejected. Not when it is trusted:
     a white garment overexposed on a dark desk is real, and auto exposure needs its mask to fix it.
+
+    ``edge_ok`` (frame cropped to the table): a garment along the frame sides is not a problem.
     """
     objects = cv2.morphologyEx(objects, cv2.MORPH_OPEN, _ellipse(2))
     objects = cv2.morphologyEx(objects, cv2.MORPH_CLOSE, _ellipse(2), iterations=2)
 
     if detach:
         radius = max(2, int(DETACH_FRAC * long_side))
-        core_pick, note = select_garment(cv2.erode(objects, _ellipse(radius)), long_side)
+        core_pick, note = select_garment(cv2.erode(objects, _ellipse(radius)), long_side, edge_ok)
         garment = None
         if core_pick is not None:
             garment = fill_holes(cv2.bitwise_and(cv2.dilate(core_pick, _ellipse(radius)), objects))
     else:
-        garment, note = select_garment(objects, long_side)
+        garment, note = select_garment(objects, long_side, edge_ok)
     if garment is None:
         return None, None, [note], {}
 
@@ -353,7 +359,9 @@ def _evaluate(objects, gray, long_side, px_per_mm, detach=False, table_class=Non
     side_contact = max(float(np.mean(s > 0)) for s in sides)
     stats['border_contact_pct'] = 100.0 * border_contact
     stats['side_contact_pct'] = 100.0 * side_contact
-    if border_contact > MAX_BORDER_CONTACT:
+    if edge_ok:
+        pass
+    elif border_contact > MAX_BORDER_CONTACT:
         problems.append('garment covers %.0f%% of the frame edge' % (100 * border_contact))
     elif side_contact > MAX_SIDE_CONTACT:
         problems.append('garment covers %.0f%% of one side of the frame' % (100 * side_contact))
@@ -393,12 +401,14 @@ def measure_contrast(image, garment_mask, ring_mask):
     return abs(float(np.median(ring_px)) - float(np.median(garment_px)))
 
 
-def separate_garment(image, px_per_mm=None):
+def separate_garment(image, px_per_mm=None, edge_ok=False):
     """Find the garment on the table and the ring of table around it.
 
     ``image`` is a BGR or grayscale frame, normally the preprocessed (cropped, undistorted) one so
     that the border band is table and not the room. ``px_per_mm`` is the frame's scale at the
     desk; when given, the ring gap and width are in millimetres, otherwise a fraction of the frame.
+    ``edge_ok``: the frame is cropped to the table only, so a garment may run off its sides (a
+    garment larger than the crop); off, anything along most of a side is taken for the room.
     """
     if image is None or getattr(image, 'size', 0) == 0:
         return SeparationResult(problems=['no image'])
@@ -421,19 +431,24 @@ def separate_garment(image, px_per_mm=None):
 
     texture = texture_energy(smooth)
     table_texture = float(np.median(texture[band])) + 0.5
-    cue_b = (texture > K_TEXTURE * table_texture).astype(np.uint8) * 255
-    cue_b = cv2.erode(cue_b, _ellipse(TEXTURE_SPREAD_PX))
-    cue_c = closed_edge_regions(smooth)
+
+    def cues_abc():
+        cue_b = (texture > K_TEXTURE * table_texture).astype(np.uint8) * 255
+        cue_b = cv2.erode(cue_b, _ellipse(TEXTURE_SPREAD_PX))
+        cue_c = closed_edge_regions(smooth)
+        return 'A+B+C', cv2.bitwise_or(cv2.bitwise_or(cue_a, cue_b), cue_c), None
 
     # The two-class split is tried whenever cue A fails, not only when the band is noisy: a dark brief
     # on a clean band (noise 2.5) joined a darker strip of table along the right side under cue A's
-    # low threshold and ran off the frame edge, while the split found it alone.
-    attempts = [('A', cue_a, None), ('A-otsu', *two_class_objects(smooth, band))]
-    attempts.append(('A+B+C', cv2.bitwise_or(cv2.bitwise_or(cue_a, cue_b), cue_c), None))
-    for cue, objects, table_class in attempts:
+    # low threshold and ran off the frame edge, while the split found it alone. Each attempt is built
+    # only when the one before it failed (the auto exposure loop separates every round, and B and C
+    # are the slow ones).
+    attempts = (lambda: ('A', cue_a, None), lambda: ('A-otsu', *two_class_objects(smooth, band)), cues_abc)
+    for attempt in attempts:
+        cue, objects, table_class = attempt()
         garment, ring, problems, stats = _evaluate(objects, gray, long_side, work_px_per_mm,
                                                    detach=table_class is not None, table_class=table_class,
-                                                   trusted=trusted)
+                                                   trusted=trusted, edge_ok=edge_ok)
         if not problems:
             break
     stats.update(table_noise=sigma, table_texture=table_texture)

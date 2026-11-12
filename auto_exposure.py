@@ -58,9 +58,19 @@ BRIGHTNESS_MIN = 0
 BRIGHTNESS_MAX = 20
 DEFAULT_EXPOSURE_US = 20000     # the camera class default when calibration.json has none
 MAX_ROUNDS = 8
+MAX_MISSES = 5                  # rounds in a row without a garment before a start gives up
+MAX_CLIPPED_SHARE = 0.5         # no garment and more of the frame than this at 250+: go down, not up
 MIN_SHARE_OF_LARGEST = 0.70     # pick_best: a segment smaller than this share of the largest one is a piece
-SETTLE_S = 0.2                  # after a change, frames already in the pipe still carry the old exposure
-DROP_FRAMES = 3                 # ...so this many new frames after the change are skipped as well
+# The frame is cropped to the table only (calibration crop): a garment may run off its sides. app.py sets
+# it for a live camera with a crop; off, a segment along a frame side is taken for the room (uncropped).
+EDGE_OK = False
+# After a change the camera keeps delivering frames shot at the old values for a while (on the Daheng a
+# whole round, 1-2 s, behind). _Camera.frame waits until a frame shows the change; see there.
+SETTLE_S = 0.2                  # always wait this long first
+MIN_NEW_FRAMES = 2              # and for at least this many new frames
+CHANGE_SEEN = 0.5               # a frame has moved this share of the expected brightness change: it is new
+FALLBACK_WAIT_S = 1.0           # change too small or hidden by clipping to see: wait this long instead
+CHANGE_TIMEOUT_S = 6.0          # never wait longer than this for one frame
 
 # (contrast below, exposure step us, brightness step); contrast at or above the last row stops.
 CONTRAST_STEPS = [
@@ -114,7 +124,7 @@ def segment_problem(res):
     if not MIN_AREA_FRAC * 100 <= area <= MAX_AREA_FRAC * 100:
         return 'area %.0f%%: not a garment' % area
     side = res.stats.get('side_contact_pct', 0.0)
-    if side > MAX_PICK_SIDE_CONTACT * 100:
+    if side > MAX_PICK_SIDE_CONTACT * 100 and not EDGE_OK:
         return 'on %.0f%% of a side: not a garment' % side
     return ''
 
@@ -150,7 +160,7 @@ def pick_best(rounds):
 def segment_contrast(frame):
     """Separate the garment and return (contrast, SeparationResult). Every mask counts, valid or not,
     unless segment_problem says it is not a garment; then the contrast is 0."""
-    res = separate_garment(frame)
+    res = separate_garment(frame, edge_ok=EDGE_OK)
     if segment_problem(res):
         return 0.0, res
     return float(res.stats.get('contrast', 0.0)), res
@@ -170,6 +180,7 @@ class _Camera:
     def __init__(self, cam, pre):
         self.cam, self.pre = cam, pre
         self.has_brightness = hasattr(cam, 'set_gain') and getattr(cam, 'gain', None) is not None
+        self.change = None          # (when, frame level before it, expected ratio) of the last change
 
     @property
     def exposure(self):
@@ -180,32 +191,77 @@ class _Camera:
         return self.cam.gain if self.has_brightness else None
 
     def apply(self, exposure, brightness):
-        if exposure != self.exposure:
+        """Set exposure and brightness, and remember what the frames should do so frame() can tell
+        when the camera has caught up."""
+        old_exposure, old_brightness = self.exposure, self.brightness
+        before = _level(self.cam.get_latest_image(copy=False))
+        if exposure != old_exposure:
             self.cam.set_exposure(exposure)
         if self.has_brightness and brightness is not None and brightness != self.cam.gain:
             self.cam.set_gain(brightness)
+        ratio = exposure / old_exposure
+        if self.has_brightness and brightness is not None and old_brightness is not None:
+            ratio *= 10 ** ((brightness - old_brightness) / 20)         # gain is in dB
+        if ratio != 1:
+            self.change = (time.time(), before, ratio)
 
-    def frame(self, timeout=5.0):
-        """A processed frame taken after the last change.
+    def frame(self):
+        """A processed frame shot at the values set last.
 
-        The frame held when the change was made, and DROP_FRAMES more after it, are skipped: on the
-        Daheng camera they still carried the old exposure. Waiting 0.2 s alone was not enough: a round
-        set to 5000 us measured a 25000 us frame (contrast 106 instead of 21), stopped at once and left
-        the camera dark. A new frame is a new array object (the capture thread replaces it; a webcam
-        or a saved image returns a new one on every call).
+        The Daheng camera kept delivering frames at the old values for a whole round after a change
+        (each round's image looked like the round before it, and the first round of every start like
+        the end of the previous start), so neither a fixed wait (0.2 s) nor skipping 3 frames was
+        enough: a round set to 5000 us measured a 25000 us frame and stopped at once.
+
+        Brightness is linear in exposure and gain (in dB), so the change says what the frames should
+        do: a frame that has moved CHANGE_SEEN of the way from the level before the change towards
+        the expected one is shot at the new values, and the next new frame is returned. When the
+        change cannot be seen (too small, or the frame clipped at 0 or 255 either side) the frame
+        after FALLBACK_WAIT_S is taken instead. A new frame is a new array object (the capture
+        thread replaces it; a webcam or a saved image returns a new one on every call).
         """
+        start = time.time()
         time.sleep(SETTLE_S + self.exposure / 1e6)
-        end = time.time() + timeout
-        last, seen = None, 0
-        while time.time() < end:
+        change, self.change = self.change, None
+        visible = False
+        if change is not None:
+            when, before, ratio = change
+            expected = min(255.0, before * ratio) if before is not None else None
+            visible = (before is not None and 3 < before < 250 and 3 < expected < 250
+                       and abs(expected - before) >= 8)
+        last, seen, moved = None, 0, False
+        while time.time() - start < CHANGE_TIMEOUT_S:
             raw = self.cam.get_latest_image(copy=False)
-            if raw is not None and raw is not last:
-                last, seen = raw, seen + 1
-                if seen > DROP_FRAMES:
-                    return self.pre(raw.copy())
-            else:
+            if raw is None or raw is last:
                 time.sleep(0.005)
+                continue
+            last, seen = raw, seen + 1
+            if seen < MIN_NEW_FRAMES:
+                continue
+            if change is None:
+                return self.pre(raw.copy())
+            if visible:
+                if moved:
+                    return self.pre(raw.copy())             # the frame after the first one that moved
+                moved = abs(_level(raw) - before) >= CHANGE_SEEN * abs(expected - before)
+            elif time.time() - change[0] >= FALLBACK_WAIT_S:
+                return self.pre(raw.copy())
         return None if last is None else self.pre(last.copy())
+
+
+def _level(raw):  
+    """Mean brightness of a raw frame (every 8th pixel), or None."""
+    if raw is None:
+        return None
+    small = raw[::8, ::8]
+    return float(small.mean())
+
+
+def clipped_share(frame):
+    """Share of the frame at 250 or more (every 4th pixel)."""
+    small = frame[::4, ::4]
+    gray = small if small.ndim == 2 else small.max(axis=2)
+    return float(np.mean(gray >= 250))
 
 
 def _clamp(value, low, high):
@@ -225,17 +281,22 @@ def save_calibration(path, exposure, brightness):
     os.replace(tmp, path)
 
 
-def run_auto_exposure(cam, pre=lambda f: f, calibration_file=None, log=print):
+def run_auto_exposure(cam, pre=lambda f: f, calibration_file=None, log=print, start=None):
     """Run the logic on a live camera. ``pre`` turns a raw frame into the processed one
-    (PreProcessor.process_image); ``calibration_file`` None does not save. ``result.best`` holds
-    the kept round, with its frame and masks."""
+    (PreProcessor.process_image); ``calibration_file`` None does not save. ``start`` is an
+    (exposure, brightness) to begin from; set here so the first round waits for it like any other
+    change. ``result.best`` holds the kept round, with its frame and masks."""
     cam = _Camera(cam, pre)
+    if start is not None:
+        cam.apply(*start)
+    initial = (cam.exposure, cam.brightness)
     result = AutoExposureResult()
     rounds = result.rounds
 
     log('\n round | exposure_us | brightness | contrast | %-44s | action' % 'segment')
     direction = +1                  # +1 going up, -1 going down
     previous = None                 # the round the last step started from
+    misses = 0                      # rounds in a row without a garment
     stop = None
     for n in range(1, MAX_ROUNDS + 1):
         frame = cam.frame()
@@ -246,8 +307,20 @@ def run_auto_exposure(cam, pre=lambda f: f, calibration_file=None, log=print):
         r = Round(n, cam.exposure, cam.brightness, contrast, segment_solidity(res), res, frame)
         rounds.append(r)
         base = r                    # the round the next step starts from
+        misses = misses + 1 if segment_problem(res) else 0
 
-        if previous is not None and r.contrast < previous.contrast:
+        # No garment and the frame mostly white: brighter cannot help, so go down. Going up (contrast
+        # 0 reads as "too dark") took white garments from 20000 us to 40000 us / brightness 20 in
+        # rounds that each found nothing and cost 2 s or more.
+        overexposed = segment_problem(res) and clipped_share(frame) > MAX_CLIPPED_SHARE
+        if misses >= MAX_MISSES:
+            r.action = 'no garment in %d rounds, STOP' % misses
+            stop = 'no garment in %d rounds in a row' % misses
+        elif overexposed and (previous is None or previous.contrast <= r.contrast):
+            if direction > 0:
+                direction = -1
+                r.action = 'frame clipped: going down'
+        elif previous is not None and r.contrast < previous.contrast:
             cam.apply(previous.exposure, previous.brightness)
             base = previous
             if direction > 0:
@@ -291,8 +364,9 @@ def run_auto_exposure(cam, pre=lambda f: f, calibration_file=None, log=print):
     found = [r for r in rounds if not segment_problem(r.separation)]
     result.found_garment = bool(found)
     if not found:
+        cam.apply(*initial)         # not left wherever the search ended (40000 us / 20 on a white shirt)
         result.exposure, result.brightness = cam.exposure, cam.brightness
-        result.reason = 'no garment found in any round'
+        result.reason = 'no garment found in any round; back to the start values'
         log('auto exposure: ' + result.reason)
         return result
 

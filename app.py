@@ -149,7 +149,7 @@ def camera_values(cam):
                                               '%g' % cam.gain if cam.gain is not None else '-')
 
 
-def run_and_save(cam, pre, folder, calibration_file=None, rgb=False):
+def run_and_save(cam, pre, folder, calibration_file=None, rgb=False, start=None):
     """Run auto exposure, print it and save it to ``folder`` (see save_run)."""
     lines = []
 
@@ -157,8 +157,12 @@ def run_and_save(cam, pre, folder, calibration_file=None, rgb=False):
         print(message)
         lines.extend(str(message).splitlines())
 
-    say('auto exposure: starting at %s' % camera_values(cam))
-    result = run_auto_exposure(cam, pre, calibration_file=calibration_file, log=log)
+    if start is None:
+        say('auto exposure: starting at %s' % camera_values(cam))
+    else:
+        say('auto exposure: starting at exposure %g us, brightness %s'
+            % (start[0], '-' if start[1] is None else '%g' % start[1]))
+    result = run_auto_exposure(cam, pre, calibration_file=calibration_file, log=log, start=start)
     save_run(result, folder, lines, rgb=rgb)
     print('-' * 100)
     if result.best is None:
@@ -200,11 +204,11 @@ def run_garment(cam, pre, name, garment_dir, starts, start_gain, rgb=False):
     """
     bests = []
     for start in starts:
-        cam.set_exposure(start)
-        if start_gain is not None and hasattr(cam, 'set_gain'):
-            cam.set_gain(start_gain)
         print('\n=== %s: start %d us' % (name, start))
-        result = run_and_save(cam, pre, os.path.join(garment_dir, 'start_%dus' % start), rgb=rgb)
+        # Set inside run_auto_exposure so its first round waits until the frames show it: set here,
+        # the first round of every start measured a frame from the end of the previous start.
+        result = run_and_save(cam, pre, os.path.join(garment_dir, 'start_%dus' % start), rgb=rgb,
+                              start=(start, start_gain))
         if result.best is not None:
             bests.append((start, result))
     print('=' * 100)
@@ -245,7 +249,8 @@ def append_summary(out, line):
 def run_folder(args, processor):
     """--images: every image in the folder, from every start exposure, saved one folder per garment."""
     auto_exposure.SETTLE_S = 0                          # a saved frame needs no settling...
-    auto_exposure.DROP_FRAMES = 0                       # ...and has no old frames in flight
+    auto_exposure.MIN_NEW_FRAMES = 0                    # ...and has no old frames in flight
+    auto_exposure.FALLBACK_WAIT_S = 0
     starts = [float(v) for v in args.starts.split(',')]
     paths = sorted(os.path.join(args.images, f) for f in os.listdir(args.images)
                    if f.lower().endswith(IMAGE_TYPES))
@@ -278,6 +283,8 @@ def main():
     parser.add_argument('--no-save', action='store_true', help='do not write the result to calibration.json')
     parser.add_argument('--once', action='store_true', help='run auto exposure once without a window, then exit')
     parser.add_argument('--no-auto', action='store_true', help='do not run auto exposure when the live view starts')
+    parser.add_argument('--strict-edges', action='store_true',
+                        help='live: treat anything along a frame side as the room even with a calibration crop')
     parser.add_argument('--out', default='captures', help='folder for the results and for frames saved with s')
     args = parser.parse_args()
     if args.camera == 'image' and not args.image:
@@ -301,6 +308,11 @@ def main():
     if processor is not None and processor.crop_bbox:
         (x0, y0), (x1, y1) = processor.crop_bbox
         say('calibration: %s, crop %dx%d at (%d, %d)' % (args.calibration, x1 - x0, y1 - y0, x0, y0))
+        # Cropped to the table: a garment larger than the crop may run off its sides. Off for --images,
+        # whose uncropped test frames have the room along their sides.
+        auto_exposure.EDGE_OK = not args.strict_edges
+    say('garments running off the frame sides are %s' % ('allowed (frame cropped to the table)'
+                                                      if auto_exposure.EDGE_OK else 'taken for the room'))
     cam = open_camera(args)
     if args.exposure:
         cam.set_exposure(args.exposure)
@@ -319,6 +331,10 @@ def main():
         append_summary(args.out, line)
         if result is not None and save_to:
             save_calibration(save_to, result.exposure, result.brightness)
+            # The camera classes re-read calibration.json when it changes and set its exposure again;
+            # it holds the values just set, but mark it read so it cannot reset a later run's start.
+            if hasattr(cam, 'last_config_mtime'):
+                cam.last_config_mtime = os.path.getmtime(save_to)
             say('%s: exposure and brightness written to %s' % (name, save_to))
 
     try:
@@ -337,7 +353,7 @@ def main():
                 say('no frame from the camera')
                 continue
             frame = pre(raw)
-            res = separate_garment(frame)
+            res = separate_garment(frame, edge_ok=auto_exposure.EDGE_OK)
             now = time.time()
             fps = 0.8 * fps + 0.2 / max(1e-3, now - last)
             last = now

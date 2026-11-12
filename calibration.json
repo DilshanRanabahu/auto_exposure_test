@@ -3,11 +3,11 @@
     "rotation_angle": 0,
     "crop_bbox": [
         [
-            1000,
+            320,
             360
         ],
         [
-            3720,
+            3740,
             2100
         ]
     ],
@@ -16,7 +16,7 @@
         3036
     ],
     "calibration_resolution": [
-        2720,
+        3420,
         1740
     ],
     "calibration_saved_by": "User A",
