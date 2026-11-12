@@ -2,8 +2,6 @@
 
     python app.py                                    # Daheng camera: auto exposure first, then the live view
     python app.py --no-auto                          # live view only, no auto exposure at start
-    python app.py --camera webcam                    # USB webcam
-    python app.py --camera image --image frame.jpg   # a saved frame, exposure simulated
     python app.py --once                             # run auto exposure once, no window, and exit
     python app.py --no-save                          # never write calibration.json
     python app.py --images C:/path/img --out C:/path/img/results/auto_exposure
@@ -52,7 +50,7 @@ import numpy as np # type: ignore
 import auto_exposure
 from auto_exposure import (DEFAULT_EXPOSURE_US, best_image, best_values, pick_best, run_auto_exposure,
                            save_calibration, save_run)
-from capture import OpenCVWebcamCapture, PreProcessor, WebcamCapture
+from capture import PreProcessor, WebcamCapture
 from garment_separation import draw_overlay, separate_garment
 
 EXPOSURE_STEP = 1.25
@@ -93,16 +91,11 @@ class ImageCamera:
 
 
 def open_camera(args):
-    if args.camera == 'image':
-        return ImageCamera(args.image)
-    if args.camera == 'webcam':
-        cam = OpenCVWebcamCapture(cam_index=args.index, calibration_file=args.calibration)
-    else:
-        cam = WebcamCapture(calibration_file=args.calibration)
+    cam = WebcamCapture(calibration_file=args.calibration)
     if not cam.start():
         sys.exit('camera did not start (see the log above)')
     # The camera classes re-read calibration.json on their first frame and would put the file's
-    # exposure back over --exposure; mark the file as already read.
+    # exposure back over the start exposure just set; mark the file as already read.
     if hasattr(cam, 'last_config_mtime') and os.path.exists(args.calibration):
         cam.last_config_mtime = os.path.getmtime(args.calibration)
     return cam
@@ -270,25 +263,17 @@ def run_folder(args, processor):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('--camera', choices=['daheng', 'webcam', 'image'], default='daheng')
-    parser.add_argument('--image', help='frame to use with --camera image')
     parser.add_argument('--images', help='folder of saved frames: run every one, exposure simulated, and exit')
     parser.add_argument('--starts', default='5000,10000,20000,39594',
                         help='start exposures in us, comma separated: auto exposure runs once from each')
     parser.add_argument('--garment', default='garment',
                         help='name for the result folders: <out>/<garment>_<time>/ per auto exposure run')
-    parser.add_argument('--index', type=int, default=0, help='webcam index')
     parser.add_argument('--calibration', default='calibration.json', help='calibration.json copied from the device')
-    parser.add_argument('--exposure', type=float, help='start exposure in us (default: the calibration value)')
     parser.add_argument('--no-save', action='store_true', help='do not write the result to calibration.json')
     parser.add_argument('--once', action='store_true', help='run auto exposure once without a window, then exit')
     parser.add_argument('--no-auto', action='store_true', help='do not run auto exposure when the live view starts')
-    parser.add_argument('--strict-edges', action='store_true',
-                        help='live: treat anything along a frame side as the room even with a calibration crop')
     parser.add_argument('--out', default='captures', help='folder for the results and for frames saved with s')
     args = parser.parse_args()
-    if args.camera == 'image' and not args.image:
-        parser.error('--camera image needs --image')
 
     processor = None
     if os.path.exists(args.calibration):
@@ -300,25 +285,21 @@ def main():
     if args.images:
         run_folder(args, processor)
         return
-    # A simulated exposure must not end up in the device's calibration.
-    save_to = None if args.no_save or args.camera == 'image' or not os.path.exists(args.calibration) \
-        else args.calibration
-    to_bgr = args.camera == 'daheng'          # Daheng frames are RGB; only the display is converted
+    save_to = None if args.no_save or not os.path.exists(args.calibration) else args.calibration
+    to_bgr = True                             # Daheng frames are RGB; only the display is converted
 
     if processor is not None and processor.crop_bbox:
         (x0, y0), (x1, y1) = processor.crop_bbox
         say('calibration: %s, crop %dx%d at (%d, %d)' % (args.calibration, x1 - x0, y1 - y0, x0, y0))
         # Cropped to the table: a garment larger than the crop may run off its sides. Off for --images,
         # whose uncropped test frames have the room along their sides.
-        auto_exposure.EDGE_OK = not args.strict_edges
+        auto_exposure.EDGE_OK = True
     say('garments running off the frame sides are %s' % ('allowed (frame cropped to the table)'
                                                       if auto_exposure.EDGE_OK else 'taken for the room'))
     cam = open_camera(args)
-    if args.exposure:
-        cam.set_exposure(args.exposure)
-    say('camera: %s started, %s' % (args.camera, camera_values(cam)))
+    say('camera: started, %s' % camera_values(cam))
     if save_to is None:
-        say('calibration.json will not be written (%s)' % ('--no-save' if args.no_save else 'no camera / no file'))
+        say('calibration.json will not be written (%s)' % ('--no-save' if args.no_save else 'no file'))
 
     starts = [float(v) for v in args.starts.split(',')]
     start_gain = cam.gain
@@ -363,7 +344,7 @@ def main():
             if key in (ord('q'), 27):
                 say('quit')
                 break
-            current = cam.exposure or DEFAULT_EXPOSURE_US        # a webcam left on its own auto has none
+            current = cam.exposure or DEFAULT_EXPOSURE_US        # none until the camera has one
             if key == ord('a'):
                 auto()
                 say('live view: %s' % camera_values(cam))

@@ -48,8 +48,7 @@ and recopy after changing the repo.
 ```bash
 sudo systemctl stop rms-app        # on a device: the camera can only be open in one process
 python3 app.py                                   # Daheng camera, window; a = auto exposure
-python3 app.py --camera webcam                   # USB webcam
-python3 app.py --camera image --image frame.jpg  # saved frame, exposure simulated (linear, gain in dB)
+python3 app.py --no-auto                         # live view only
 python3 app.py --once                            # auto exposure once, no window
 python3 app.py --no-save                         # never write calibration.json
 python3 app.py --images <folder> --out <results>  # every image, from each --starts exposure (simulated)
@@ -75,8 +74,9 @@ and `summary.txt`; the calibration crop is used only when the frame is `stage1_r
 Latest run (`img/results/auto_exposure_v5`, images renamed `01_..25_`, map in `img/rename_map.csv`):
 22/25 right; wrong: 02, 03, 14 (1024 px overexposed white t-shirts, no outline in any round).
 
-`app.py` sets the camera's `last_config_mtime` after `start()` so `--exposure` is not overwritten by the
-file on the first frame, and converts Daheng RGB frames to BGR for the window and saved images only
+`app.py` (Daheng only; `--camera`, `--image`, `--index`, `--exposure`, `--strict-edges` were removed,
+a crop always sets `EDGE_OK`) sets the camera's `last_config_mtime` after `start()` so the start exposure
+is not overwritten by the file on the first frame, and converts Daheng RGB frames to BGR for the window and saved images only
 (separation gets the frame as the scanner app does). Only image mode was run; **not run on a real camera yet**.
 
 ## How the separation works (`separate_garment(image, px_per_mm=None)`)

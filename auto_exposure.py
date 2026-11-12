@@ -54,8 +54,10 @@ from garment_separation import (MAX_AREA_FRAC, MAX_PICK_SIDE_CONTACT, MIN_AREA_F
 
 EXPOSURE_MIN_US = 2000
 EXPOSURE_MAX_US = 40000
+
 BRIGHTNESS_MIN = 0
 BRIGHTNESS_MAX = 20
+
 DEFAULT_EXPOSURE_US = 20000     # the camera class default when calibration.json has none
 MAX_ROUNDS = 8
 MAX_MISSES = 5                  # rounds in a row without a garment before a start gives up
