@@ -45,6 +45,7 @@ import json
 import os
 import time
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 
 import cv2 # type: ignore
 import numpy as np # type: ignore
@@ -106,6 +107,7 @@ class AutoExposureResult:
     found_garment: bool = False
     best: Round = None          # the round that was kept: its masks are the best segment
     saved: bool = False
+    seconds: float = 0.0        # wall time of the run (frames, separation and the camera waits)
     rounds: list = field(default_factory=list)
 
 
@@ -133,12 +135,15 @@ def segment_problem(res):
 
 def segment_solidity(res):
     """Segment area / area of its convex hull (0-1). A whole garment fills its hull except for the gaps
-    between legs or sleeves; a mask broken up by clipping leaves holes and bays and scores lower."""
+    between legs or sleeves; a mask broken up by clipping leaves holes and bays and scores lower.
+
+    The hull is taken of the outer contours: the same hull as of every pixel, and ~10 ms instead of
+    ~700 ms on a 4024x3036 frame."""
     mask = res.garment_mask
     if mask is None or not np.any(mask):
         return 0.0
-    points = cv2.findNonZero(mask)
-    hull = cv2.convexHull(points)
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    hull = cv2.convexHull(np.vstack(contours))
     hull_area = cv2.contourArea(hull)
     return float(np.count_nonzero(mask)) / hull_area if hull_area > 0 else 0.0
 
@@ -288,6 +293,7 @@ def run_auto_exposure(cam, pre=lambda f: f, calibration_file=None, log=print, st
     (PreProcessor.process_image); ``calibration_file`` None does not save. ``start`` is an
     (exposure, brightness) to begin from; set here so the first round waits for it like any other
     change. ``result.best`` holds the kept round, with its frame and masks."""
+    t0 = time.time()
     cam = _Camera(cam, pre)
     if start is not None:
         cam.apply(*start)
@@ -369,7 +375,8 @@ def run_auto_exposure(cam, pre=lambda f: f, calibration_file=None, log=print, st
         cam.apply(*initial)         # not left wherever the search ended (40000 us / 20 on a white shirt)
         result.exposure, result.brightness = cam.exposure, cam.brightness
         result.reason = 'no garment found in any round; back to the start values'
-        log('auto exposure: ' + result.reason)
+        result.seconds = time.time() - t0
+        log('auto exposure: %s (%d rounds, %.1f s)' % (result.reason, len(rounds), result.seconds))
         return result
 
     best, picked_by = pick_best(found)
@@ -378,8 +385,10 @@ def run_auto_exposure(cam, pre=lambda f: f, calibration_file=None, log=print, st
     result.exposure, result.brightness = best.exposure, best.brightness
     result.contrast, result.solidity = best.contrast, best.solidity
     result.reason = '%s; best round %d by %s' % (stop, best.n, picked_by)
-    log('auto exposure: %s -> %d us, brightness %s (contrast %.0f, solidity %.2f)' % (
-        result.reason, result.exposure, result.brightness, result.contrast, result.solidity))
+    result.seconds = time.time() - t0
+    log('auto exposure: %s -> %d us, brightness %s (contrast %.0f, solidity %.2f); %d rounds in %.1f s' % (
+        result.reason, result.exposure, result.brightness, result.contrast, result.solidity,
+        len(rounds), result.seconds))
 
     if calibration_file:
         save_calibration(calibration_file, result.exposure, result.brightness)
@@ -388,10 +397,22 @@ def run_auto_exposure(cam, pre=lambda f: f, calibration_file=None, log=print, st
     return result
 
 
-def _label(image, lines, long_side=1100):
-    """The image scaled to ``long_side`` with text lines on top."""
-    scale = long_side / max(image.shape[:2])
-    vis = cv2.resize(image, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+def _label(frame, separation, lines, rgb=False, long_side=1100):
+    """The frame scaled to ``long_side`` with its segment drawn and text lines on top. The frame and
+    the masks are scaled first and drawn on small: drawing on a 4024x3036 frame and scaling the
+    result took ~0.5 s a round. ``rgb``: the frame is RGB (Daheng), the image is BGR."""
+    h, w = frame.shape[:2]
+    scale = long_side / max(h, w)
+    size = (max(1, round(w * scale)), max(1, round(h * scale)))
+    vis = cv2.resize(frame, size, interpolation=cv2.INTER_AREA)
+    if rgb and vis.ndim == 3:
+        vis = cv2.cvtColor(vis, cv2.COLOR_RGB2BGR)
+
+    def small(mask):
+        return None if mask is None else cv2.resize(mask, size, interpolation=cv2.INTER_NEAREST)
+
+    vis = draw_overlay(vis, SimpleNamespace(garment_mask=small(separation.garment_mask),
+                                            ring_mask=small(separation.ring_mask)))
     for i, text in enumerate(lines):
         y = 32 + 30 * i
         cv2.putText(vis, text, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 0, 0), 4, cv2.LINE_AA)
@@ -420,11 +441,10 @@ def best_values(result):
 def best_image(result, rgb=False, title='BEST'):
     """The kept round's frame with its segment and its exposure, brightness and contrast written on it."""
     b = result.best
-    frame = cv2.cvtColor(b.frame, cv2.COLOR_RGB2BGR) if rgb and b.frame.ndim == 3 else b.frame
-    return _label(draw_overlay(frame, b.separation), [
+    return _label(b.frame, b.separation, [
         '%s: exposure %d us   brightness %s' % (title, b.exposure, '-' if b.brightness is None else '%g' % b.brightness),
         'contrast %.0f   solidity %.2f   area %.0f%%' % (b.contrast, b.solidity, b.separation.stats.get('area_pct', 0.0)),
-        'round %d, picked by %s' % (b.n, result.picked_by)])
+        'round %d, picked by %s' % (b.n, result.picked_by)], rgb=rgb)
 
 
 def save_run(result, folder, log_lines=(), rgb=False):
@@ -433,14 +453,13 @@ def save_run(result, folder, log_lines=(), rgb=False):
     area, plus every round), and log.txt. ``rgb``: the frames are RGB (Daheng), the images are BGR."""
     os.makedirs(folder, exist_ok=True)
     for r in result.rounds:
-        frame = cv2.cvtColor(r.frame, cv2.COLOR_RGB2BGR) if rgb and r.frame.ndim == 3 else r.frame
         cv2.imwrite(os.path.join(folder, 'round%d_%dus.jpg' % (r.n, r.exposure)), _label(
-            draw_overlay(frame, r.separation),
+            r.frame, r.separation,
             ['round %d: exposure %d us   brightness %s' % (r.n, r.exposure,
                                                           '-' if r.brightness is None else '%g' % r.brightness),
              'contrast %.0f   solidity %.2f   area %.0f%%' % (r.contrast, r.solidity,
                                                               r.separation.stats.get('area_pct', 0.0)),
-             '-> ' + r.action]))
+             '-> ' + r.action], rgb=rgb))
     with open(os.path.join(folder, 'log.txt'), 'w') as f:
         f.write('\n'.join(log_lines) + '\n')
     data = {'time': time.strftime('%Y-%m-%dT%H:%M:%S'), 'best': best_values(result),

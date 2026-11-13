@@ -185,7 +185,7 @@ def crop_fits(processor, frame):
     return int(x1) <= w and int(y1) <= h
 
 
-SUMMARY_HEADER = '%-40s | best exposure, brightness, contrast, solidity' % 'garment'
+SUMMARY_HEADER = '%-40s | best exposure, brightness, contrast, solidity | rounds, time' % 'garment'
 
 
 def run_garment(cam, pre, name, garment_dir, starts, start_gain, rgb=False):
@@ -195,20 +195,29 @@ def run_garment(cam, pre, name, garment_dir, starts, start_gain, rgb=False):
     best.json, log.txt), and the best of all starts as BEST_<us>us.jpg and best.json. The camera is
     left at the best exposure and brightness. Returns (summary line, best result or None).
     """
-    bests = []
+    t0 = time.time()
+    bests, results = [], []
     for start in starts:
         print('\n=== %s: start %d us' % (name, start))
         # Set inside run_auto_exposure so its first round waits until the frames show it: set here,
         # the first round of every start measured a frame from the end of the previous start.
         result = run_and_save(cam, pre, os.path.join(garment_dir, 'start_%dus' % start), rgb=rgb,
                               start=(start, start_gain))
+        results.append((start, result))
         if result.best is not None:
             bests.append((start, result))
+    total = time.time() - t0
+    rounds = sum(len(r.rounds) for _, r in results)
+    timing = {'seconds': round(total, 1), 'rounds': rounds}
+    print('=' * 100)
+    print('TOTAL TIME %s: %.1f s  (%d rounds, %d starts)' % (name, total, rounds, len(results)))
     print('=' * 100)
     if not bests:
-        say('%s: NO GARMENT FOUND from any start' % name)
+        say('%s: NO GARMENT FOUND from any start (%d rounds, %.1f s)' % (name, rounds, total))
         print('=' * 100, flush=True)
-        return '%-40s | no garment found from any start' % name[:40], None
+        with open(os.path.join(garment_dir, 'best.json'), 'w') as f:
+            json.dump({'best': None, 'time': timing}, f, indent=4)
+        return '%-40s | no garment found from any start | %2d rounds %6.1f s' % (name[:40], rounds, total), None
     best_round, _ = pick_best([r.best for _, r in bests])
     start, result = next((s, r) for s, r in bests if r.best is best_round)
     cam.set_exposure(result.exposure)
@@ -216,16 +225,17 @@ def run_garment(cam, pre, name, garment_dir, starts, start_gain, rgb=False):
         cam.set_gain(result.brightness)
     values = dict(best_values(result), start_exposure=start)
     with open(os.path.join(garment_dir, 'best.json'), 'w') as f:
-        json.dump({'best': values, 'per_start': {'%d' % s: best_values(r) for s, r in bests}}, f, indent=4)
+        json.dump({'best': values, 'per_start': {'%d' % s: best_values(r) for s, r in bests},
+                   'time': timing}, f, indent=4)
     cv2.imwrite(os.path.join(garment_dir, 'BEST_%dus.jpg' % result.exposure),
                 best_image(result, rgb=rgb, title='BEST (start %d us)' % start))
     brightness = '-' if result.brightness is None else '%g' % result.brightness
     say('%s: BEST OF ALL STARTS exposure %d us, brightness %s, contrast %.0f, solidity %.2f (from start %d us)'
         % (name, result.exposure, brightness, result.contrast, result.solidity, start))
-    say('%s: saved to %s' % (name, garment_dir))
+    say('%s: %d rounds in %.1f s; saved to %s' % (name, rounds, total, garment_dir))
     print('=' * 100, flush=True)
-    line = '%-40s | %6d us | brightness %5s | contrast %4.0f | solidity %.2f | from start %d' % (
-        name[:40], result.exposure, brightness, result.contrast, result.solidity, start)
+    line = '%-40s | %6d us | brightness %5s | contrast %4.0f | solidity %.2f | from start %d | %2d rounds %6.1f s' % (
+        name[:40], result.exposure, brightness, result.contrast, result.solidity, start, rounds, total)
     return line, result
 
 
