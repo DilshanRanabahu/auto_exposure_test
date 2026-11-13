@@ -82,6 +82,23 @@ def segment(raw, pre, edge_ok):
     processed = pre.process_image(raw)
     return processed, separate_garment(processed, edge_ok=edge_ok)
 
+def measure(frame, res):
+    """(contrast c, intensity i) of a frame with its SeparationResult, or (None, None) without a garment.
+
+    i = mean intensity of the detected garment
+    c = mean intensity of the detected garment - mean intensity of the detected ring
+        (negative: the garment is darker than the table around it)
+    """
+    if res.garment_mask is None or res.ring_mask is None:
+        return None, None
+    gray = frame if frame.ndim == 2 else cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)   # as separate_garment
+    garment_px, ring_px = gray[res.garment_mask > 0], gray[res.ring_mask > 0]
+    if not garment_px.size or not ring_px.size:
+        return None, None
+    i = float(garment_px.mean())
+    c = i - float(ring_px.mean())
+    return c, i
+
 
 def overlay(processed, res, cam):
     """The processed frame (RGB from the Daheng camera, shown as BGR) with the segment and the values."""
@@ -92,9 +109,11 @@ def overlay(processed, res, cam):
     if res.garment_mask is None:
         lines.append('no garment: %s' % '; '.join(res.problems[:1]))
     else:
-        lines.append('%s   cue %s   area %.0f%%   contrast %.0f' % (
-            'VALID' if res.valid else 'NOT VALID', res.cue, res.stats.get('area_pct', 0.0),
-            res.stats.get('contrast', 0.0)))
+        c, i = measure(processed, res)
+        lines.append('%s   cue %s   area %.0f%%' % (
+            'VALID' if res.valid else 'NOT VALID', res.cue, res.stats.get('area_pct', 0.0)))
+        if c is not None:
+            lines.append('c = %.1f   i = %.1f' % (c, i))
         if res.problems:
             lines.append(res.problems[0])
     for i, text in enumerate(lines):
@@ -129,9 +148,10 @@ def run_camera(once, out):
                 sys.exit('no frame from the camera')
             processed, res = segment(raw, pre, edge_ok)
             prefix = save(out, raw, processed, overlay(processed, res, cam))
-            print('valid=%s cue=%s area=%.1f%% contrast=%.0f problems=%s' % (
-                res.valid, res.cue, res.stats.get('area_pct', 0.0), res.stats.get('contrast', 0.0),
-                '; '.join(res.problems) or '-'))
+            c, i = measure(processed, res)
+            print('valid=%s cue=%s area=%.1f%% problems=%s' % (
+                res.valid, res.cue, res.stats.get('area_pct', 0.0), '; '.join(res.problems) or '-'))
+            print('c = %s   i = %s' % ('-' if c is None else '%.1f' % c, '-' if i is None else '%.1f' % i))
             print('saved %s_*.jpg' % prefix)
             return
 
