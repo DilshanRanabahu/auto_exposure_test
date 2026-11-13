@@ -1,473 +1,174 @@
-"""Auto exposure, sample logic v2: only contrast, exposure and brightness (gain).
+"""Auto exposure: the reference image's values, and the camera frame with the garment separated.
 
-Every round takes a new frame and separates the garment again (``separate_garment``). Any mask
-it finds is used, whether the separator calls it valid or not, as long as it can be a garment: it
-covers 4-90% of the frame (smaller is the label or print of a clipped white garment) and does not
-run along more than 15% of a frame side. Otherwise it counts as contrast 0. The contrast is measured with that round's own garment and ring.
+Reference: measured from REFERENCE_IMAGE when this file is loaded, so a new reference image
+changes the values on its own. Whole image, no segmentation.
 
-Each round looks the contrast up:
+    brightness = mean grey level of the image (0-255)
+    exposure   = log2(brightness / 118): stops from middle grey (0 = middle grey, + brighter, - darker)
 
-    contrast   0-10  -> exposure +3000, brightness +2
-    contrast  10-20  -> exposure +3000, brightness +1
-    contrast  20-40  -> exposure +2000
-    contrast  40-70  -> exposure +1000
-    contrast  > 70   -> STOP
+Camera: camera -> PreProcessor (rotate, crop, undistort from calibration.json) -> separate_garment
 
-then rechecks it:
+    python auto_exposure.py                      # window: live frame with the garment separated
+    python auto_exposure.py --once               # one frame, no window: segment it, save it and exit
+    python auto_exposure.py --reference          # print the reference image's values
+    python auto_exposure.py --reference other.png  # print another image's values
 
-    contrast went up       -> keep going
-    contrast went down     -> back to the previous values; if we were going up, turn round and go
-                              down with the same steps (exposure -3000, brightness -2, ...);
-                              if we were already going down, STOP
-    exposure and brightness at their limit -> STOP
-    8 rounds done          -> STOP
+Keys in the window:
+    s         save the raw frame, the processed frame and the overlay
+    q / Esc   quit
 
-At the end the best round is set. Only rounds whose segment is at least 70% of the largest one
-take part: a print, a corner of the table cloth or the desk beside it is far smaller than the
-garment and can have a far higher contrast (the print of a clipped white t-shirt: 5% of the frame,
-contrast 212; the t-shirt itself: 28%, contrast 1). Among those:
+On a device stop the scanner app first (the camera can only be open in one process):
 
-    any round with contrast >= 15  -> the highest contrast (dark and coloured garments)
-    all below 15 (white on white)  -> the most solid segment: area / convex hull area. Below 15 the
-                                      contrast says nothing about the segment: on white briefs the
-                                      clean, whole outline had contrast 1 and a mask broken by
-                                      clipping had 14.
-
-Its ``exposure`` and ``gain`` are written to calibration.json (atomically), and ``save_run``
-writes every round's image and the best segment with its exposure, brightness and contrast to a
-folder. The camera classes in capture.py watch calibration.json and keep the values, and so does
-the scanner app.
-
-All numbers are a first guess, to be tuned on the device. Run it with app.py.
+    sudo systemctl stop rms-app
 """
 
-import json
+import argparse
+import math
 import os
+import sys
 import time
-from dataclasses import dataclass, field
-from types import SimpleNamespace
 
 import cv2 # type: ignore
-import numpy as np # type: ignore
 
-from garment_separation import (MAX_AREA_FRAC, MAX_PICK_SIDE_CONTACT, MIN_AREA_FRAC, MIN_CONTRAST, draw_overlay,
-                                separate_garment)
+from capture import PreProcessor, WebcamCapture
+from garment_separation import draw_overlay, separate_garment
 
-EXPOSURE_MIN_US = 2000
-EXPOSURE_MAX_US = 40000
-
-BRIGHTNESS_MIN = 0
-BRIGHTNESS_MAX = 20
-
-DEFAULT_EXPOSURE_US = 20000     # the camera class default when calibration.json has none
-MAX_ROUNDS = 8
-MAX_MISSES = 5                  # rounds in a row without a garment before a start gives up
-MAX_CLIPPED_SHARE = 0.5         # no garment and more of the frame than this at 250+: go down, not up
-MIN_SHARE_OF_LARGEST = 0.70     # pick_best: a segment smaller than this share of the largest one is a piece
-# The frame is cropped to the table only (calibration crop): a garment may run off its sides. app.py sets
-# it for a live camera with a crop; off, a segment along a frame side is taken for the room (uncropped).
-EDGE_OK = False
-# After a change the camera keeps delivering frames shot at the old values for a while (on the Daheng a
-# whole round, 1-2 s, behind). _Camera.frame waits until a frame shows the change; see there.
-SETTLE_S = 0.2                  # always wait this long first
-MIN_NEW_FRAMES = 2              # and for at least this many new frames
-CHANGE_SEEN = 0.5               # a frame has moved this share of the expected brightness change: it is new
-FALLBACK_WAIT_S = 1.0           # change too small or hidden by clipping to see: wait this long instead
-CHANGE_TIMEOUT_S = 6.0          # never wait longer than this for one frame
-
-# (contrast below, exposure step us, brightness step); contrast at or above the last row stops.
-CONTRAST_STEPS = [
-    (10, 3000, 2),
-    (20, 3000, 1),
-    (40, 2000, 0),
-    (70, 1000, 0),
-]
+HERE = os.path.dirname(os.path.abspath(__file__))
+CALIBRATION_FILE = os.path.join(HERE, 'calibration.json')
+REFERENCE_IMAGE = os.path.join(HERE, 'image.png')
+MIDDLE_GREY = 118
+DISPLAY_LONG_SIDE = 1100
 
 
-@dataclass
-class Round:
-    n: int
-    exposure: float
-    brightness: float
-    contrast: float
-    solidity: float = 0.0       # segment area / convex hull area, 0-1
-    separation: object = None   # SeparationResult of this round's frame (masks may be None)
-    frame: object = None        # the processed frame the masks were found on
-    action: str = ''
+# =========================================================================================
+# Reference
+# =========================================================================================
+def image_values(image):
+    """(exposure, brightness) of a BGR or grey image."""
+    gray = image if image.ndim == 2 else cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    brightness = float(gray.mean())
+    exposure = math.log2(max(brightness, 1.0) / MIDDLE_GREY)
+    return exposure, brightness
 
 
-@dataclass
-class AutoExposureResult:
-    exposure: float = None
-    brightness: float = None
-    contrast: float = 0.0
-    solidity: float = 0.0
-    picked_by: str = ''         # 'contrast' or 'solidity'
-    reason: str = ''
-    found_garment: bool = False
-    best: Round = None          # the round that was kept: its masks are the best segment
-    saved: bool = False
-    seconds: float = 0.0        # wall time of the run (frames, separation and the camera waits)
-    rounds: list = field(default_factory=list)
+def load_reference(path=REFERENCE_IMAGE):
+    """(exposure, brightness) of the reference image."""
+    image = cv2.imread(path)
+    if image is None:
+        raise FileNotFoundError('reference image not found: %s' % path)
+    return image_values(image)
 
 
-def segment_problem(res):
-    """Why this mask is not a garment, or '' when it can be one. Contrast alone cannot tell: it only
-    says how much the mask differs from its ring, not what the mask is.
-
-    - Size outside 4-90% of the frame (the separator's own garment size). Smaller is a piece of the
-      garment or something else on the table: when a white garment clips into the table, its dark
-      label is all that is left, and its contrast (19 on a test frame) beat the whole garment's (4).
-    - Along more than 15% of one frame side (the separator's MAX_PICK_SIDE_CONTACT). A garment lies
-      in the middle of the table; at a low exposure a darker corner of the table cloth running along
-      two sides came out as the object, with contrast 65 against the white t-shirt's 3.
-    """
-    if res.garment_mask is None:
-        return 'no garment'
-    area = res.stats.get('area_pct', 0.0)
-    if not MIN_AREA_FRAC * 100 <= area <= MAX_AREA_FRAC * 100:
-        return 'area %.0f%%: not a garment' % area
-    side = res.stats.get('side_contact_pct', 0.0)
-    if side > MAX_PICK_SIDE_CONTACT * 100 and not EDGE_OK:
-        return 'on %.0f%% of a side: not a garment' % side
-    return ''
+# Reference (measured from image.png when this file is loaded)
+REFERENCE_EXPOSURE, REFERENCE_BRIGHTNESS = load_reference()
 
 
-def segment_solidity(res):
-    """Segment area / area of its convex hull (0-1). A whole garment fills its hull except for the gaps
-    between legs or sleeves; a mask broken up by clipping leaves holes and bays and scores lower.
-
-    The hull is taken of the outer contours: the same hull as of every pixel, and ~10 ms instead of
-    ~700 ms on a 4024x3036 frame."""
-    mask = res.garment_mask
-    if mask is None or not np.any(mask):
-        return 0.0
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    hull = cv2.convexHull(np.vstack(contours))
-    hull_area = cv2.contourArea(hull)
-    return float(np.count_nonzero(mask)) / hull_area if hull_area > 0 else 0.0
-
-
-def area_pct(r):
-    return float(r.separation.stats.get('area_pct', 0.0))
-
-
-def pick_best(rounds):
-    """(best round, 'contrast' or 'solidity'). See the module docstring. Rounds whose segment is
-    smaller than MIN_SHARE_OF_LARGEST of the largest are pieces of the garment or of the table and
-    are left out first; a whole garment's segment keeps its size from round to round (28-29% on a
-    white t-shirt) while its print or a corner of the cloth was 4-14%."""
-    largest = max(area_pct(r) for r in rounds)
-    rounds = [r for r in rounds if area_pct(r) >= MIN_SHARE_OF_LARGEST * largest]
-    if max(r.contrast for r in rounds) >= MIN_CONTRAST:
-        return max(rounds, key=lambda r: r.contrast), 'contrast'
-    return max(rounds, key=lambda r: r.solidity), 'solidity'
-
-
-def segment_contrast(frame):
-    """Separate the garment and return (contrast, SeparationResult). Every mask counts, valid or not,
-    unless segment_problem says it is not a garment; then the contrast is 0."""
-    res = separate_garment(frame, edge_ok=EDGE_OK)
-    if segment_problem(res):
-        return 0.0, res
-    return float(res.stats.get('contrast', 0.0)), res
-
-
-def contrast_step(contrast):
-    """(exposure step, brightness step) for this contrast, or None to stop."""
-    for below, d_exposure, d_brightness in CONTRAST_STEPS:
-        if contrast < below:
-            return d_exposure, d_brightness
+# =========================================================================================
+# Camera frame -> garment
+# =========================================================================================
+def wait_frame(cam, timeout=5.0):
+    """The camera's latest frame, waiting up to ``timeout`` seconds for the first one."""
+    end = time.time() + timeout
+    while time.time() < end:
+        frame = cam.get_latest_image()
+        if frame is not None:
+            return frame
+        time.sleep(0.02)
     return None
 
 
-class _Camera:
-    """The camera calls the loop needs. A camera without gain control (or on its own auto) keeps its brightness."""
-
-    def __init__(self, cam, pre):
-        self.cam, self.pre = cam, pre
-        self.has_brightness = hasattr(cam, 'set_gain') and getattr(cam, 'gain', None) is not None
-        self.change = None          # (when, frame level before it, expected ratio) of the last change
-
-    @property
-    def exposure(self):
-        return self.cam.exposure or DEFAULT_EXPOSURE_US
-
-    @property
-    def brightness(self):
-        return self.cam.gain if self.has_brightness else None
-
-    def apply(self, exposure, brightness):
-        """Set exposure and brightness, and remember what the frames should do so frame() can tell
-        when the camera has caught up."""
-        old_exposure, old_brightness = self.exposure, self.brightness
-        before = _level(self.cam.get_latest_image(copy=False))
-        if exposure != old_exposure:
-            self.cam.set_exposure(exposure)
-        if self.has_brightness and brightness is not None and brightness != self.cam.gain:
-            self.cam.set_gain(brightness)
-        ratio = exposure / old_exposure
-        if self.has_brightness and brightness is not None and old_brightness is not None:
-            ratio *= 10 ** ((brightness - old_brightness) / 20)         # gain is in dB
-        if ratio != 1:
-            self.change = (time.time(), before, ratio)
-
-    def frame(self):
-        """A processed frame shot at the values set last.
-
-        The Daheng camera kept delivering frames at the old values for a whole round after a change
-        (each round's image looked like the round before it, and the first round of every start like
-        the end of the previous start), so neither a fixed wait (0.2 s) nor skipping 3 frames was
-        enough: a round set to 5000 us measured a 25000 us frame and stopped at once.
-
-        Brightness is linear in exposure and gain (in dB), so the change says what the frames should
-        do: a frame that has moved CHANGE_SEEN of the way from the level before the change towards
-        the expected one is shot at the new values, and the next new frame is returned. When the
-        change cannot be seen (too small, or the frame clipped at 0 or 255 either side) the frame
-        after FALLBACK_WAIT_S is taken instead. A new frame is a new array object (the capture
-        thread replaces it; a webcam or a saved image returns a new one on every call).
-        """
-        start = time.time()
-        time.sleep(SETTLE_S + self.exposure / 1e6)
-        change, self.change = self.change, None
-        visible = False
-        if change is not None:
-            when, before, ratio = change
-            expected = min(255.0, before * ratio) if before is not None else None
-            visible = (before is not None and 3 < before < 250 and 3 < expected < 250
-                       and abs(expected - before) >= 8)
-        last, seen, moved = None, 0, False
-        while time.time() - start < CHANGE_TIMEOUT_S:
-            raw = self.cam.get_latest_image(copy=False)
-            if raw is None or raw is last:
-                time.sleep(0.005)
-                continue
-            last, seen = raw, seen + 1
-            if seen < MIN_NEW_FRAMES:
-                continue
-            if change is None:
-                return self.pre(raw.copy())
-            if visible:
-                if moved:
-                    return self.pre(raw.copy())             # the frame after the first one that moved
-                moved = abs(_level(raw) - before) >= CHANGE_SEEN * abs(expected - before)
-            elif time.time() - change[0] >= FALLBACK_WAIT_S:
-                return self.pre(raw.copy())
-        return None if last is None else self.pre(last.copy())
+def segment(raw, pre, edge_ok):
+    """(processed frame, SeparationResult) for one raw camera frame."""
+    processed = pre.process_image(raw)
+    return processed, separate_garment(processed, edge_ok=edge_ok)
 
 
-def _level(raw):  
-    """Mean brightness of a raw frame (every 8th pixel), or None."""
-    if raw is None:
-        return None
-    small = raw[::8, ::8]
-    return float(small.mean())
-
-
-def clipped_share(frame):
-    """Share of the frame at 250 or more (every 4th pixel)."""
-    small = frame[::4, ::4]
-    gray = small if small.ndim == 2 else small.max(axis=2)
-    return float(np.mean(gray >= 250))
-
-
-def _clamp(value, low, high):
-    return max(low, min(high, value))
-
-
-def save_calibration(path, exposure, brightness):
-    """Write exposure (and gain) into calibration.json, keeping every other key; atomic (.tmp + os.replace)."""
-    with open(path, 'r') as f:
-        data = json.load(f)
-    data['exposure'] = float(exposure)
-    if brightness is not None:
-        data['gain'] = float(brightness)
-    tmp = path + '.tmp'
-    with open(tmp, 'w') as f:
-        json.dump(data, f, indent=4)
-    os.replace(tmp, path)
-
-
-def run_auto_exposure(cam, pre=lambda f: f, calibration_file=None, log=print, start=None):
-    """Run the logic on a live camera. ``pre`` turns a raw frame into the processed one
-    (PreProcessor.process_image); ``calibration_file`` None does not save. ``start`` is an
-    (exposure, brightness) to begin from; set here so the first round waits for it like any other
-    change. ``result.best`` holds the kept round, with its frame and masks."""
-    t0 = time.time()
-    cam = _Camera(cam, pre)
-    if start is not None:
-        cam.apply(*start)
-    initial = (cam.exposure, cam.brightness)
-    result = AutoExposureResult()
-    rounds = result.rounds
-
-    log('\n round | exposure_us | brightness | contrast | %-44s | action' % 'segment')
-    direction = +1                  # +1 going up, -1 going down
-    previous = None                 # the round the last step started from
-    misses = 0                      # rounds in a row without a garment
-    stop = None
-    for n in range(1, MAX_ROUNDS + 1):
-        frame = cam.frame()
-        if frame is None:
-            stop = 'no frame from the camera'
-            break
-        contrast, res = segment_contrast(frame)
-        r = Round(n, cam.exposure, cam.brightness, contrast, segment_solidity(res), res, frame)
-        rounds.append(r)
-        base = r                    # the round the next step starts from
-        misses = misses + 1 if segment_problem(res) else 0
-
-        # No garment and the frame mostly white: brighter cannot help, so go down. Going up (contrast
-        # 0 reads as "too dark") took white garments from 20000 us to 40000 us / brightness 20 in
-        # rounds that each found nothing and cost 2 s or more.
-        overexposed = segment_problem(res) and clipped_share(frame) > MAX_CLIPPED_SHARE
-        if misses >= MAX_MISSES:
-            r.action = 'no garment in %d rounds, STOP' % misses
-            stop = 'no garment in %d rounds in a row' % misses
-        elif overexposed and (previous is None or previous.contrast <= r.contrast):
-            if direction > 0:
-                direction = -1
-                r.action = 'frame clipped: going down'
-        elif previous is not None and r.contrast < previous.contrast:
-            cam.apply(previous.exposure, previous.brightness)
-            base = previous
-            if direction > 0:
-                direction = -1
-                r.action = 'contrast fell: back to %d us, now going down' % previous.exposure
-            else:
-                r.action = 'contrast fell: back to %d us, STOP' % previous.exposure
-                stop = 'contrast fell going both ways'
-        if stop is None:
-            step = contrast_step(base.contrast)
-            if step is None:
-                r.action = r.action or 'STOP'
-                stop = 'contrast above %d' % CONTRAST_STEPS[-1][0]
-            else:
-                exposure = _clamp(base.exposure + direction * step[0], EXPOSURE_MIN_US, EXPOSURE_MAX_US)
-                brightness = (_clamp(base.brightness + direction * step[1], BRIGHTNESS_MIN, BRIGHTNESS_MAX)
-                              if cam.has_brightness else None)
-                if (exposure, brightness) == (base.exposure, base.brightness):
-                    r.action = (r.action + '; ' if r.action else '') + 'at the limit, STOP'
-                    stop = 'exposure and brightness at their limit'
-                else:
-                    if not r.action:
-                        r.action = 'exposure %+d%s' % (
-                            exposure - base.exposure,
-                            ', brightness %+g' % (brightness - base.brightness) if cam.has_brightness else '')
-                    previous = base
-                    cam.apply(exposure, brightness)
-
-        if segment_problem(res):
-            segment = segment_problem(res)
-        else:
-            segment = 'area %.0f%%, solid %.2f' % (res.stats.get('area_pct', 0.0), r.solidity)
-        log('%6d | %11d | %10s | %8.0f | %-44s | %s' % (
-            r.n, r.exposure, '-' if r.brightness is None else '%g' % r.brightness,
-            r.contrast, segment, r.action))
-        if stop:
-            break
+def overlay(processed, res, cam):
+    """The processed frame (RGB from the Daheng camera, shown as BGR) with the segment and the values."""
+    vis = draw_overlay(cv2.cvtColor(processed, cv2.COLOR_RGB2BGR), res)
+    scale = DISPLAY_LONG_SIDE / max(vis.shape[:2])
+    vis = cv2.resize(vis, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+    lines = ['exposure %s us   brightness %s' % (cam.exposure, cam.gain)]
+    if res.garment_mask is None:
+        lines.append('no garment: %s' % '; '.join(res.problems[:1]))
     else:
-        stop = '%d rounds done' % MAX_ROUNDS
-
-    found = [r for r in rounds if not segment_problem(r.separation)]
-    result.found_garment = bool(found)
-    if not found:
-        cam.apply(*initial)         # not left wherever the search ended (40000 us / 20 on a white shirt)
-        result.exposure, result.brightness = cam.exposure, cam.brightness
-        result.reason = 'no garment found in any round; back to the start values'
-        result.seconds = time.time() - t0
-        log('auto exposure: %s (%d rounds, %.1f s)' % (result.reason, len(rounds), result.seconds))
-        return result
-
-    best, picked_by = pick_best(found)
-    cam.apply(best.exposure, best.brightness)
-    result.best, result.picked_by = best, picked_by
-    result.exposure, result.brightness = best.exposure, best.brightness
-    result.contrast, result.solidity = best.contrast, best.solidity
-    result.reason = '%s; best round %d by %s' % (stop, best.n, picked_by)
-    result.seconds = time.time() - t0
-    log('auto exposure: %s -> %d us, brightness %s (contrast %.0f, solidity %.2f); %d rounds in %.1f s' % (
-        result.reason, result.exposure, result.brightness, result.contrast, result.solidity,
-        len(rounds), result.seconds))
-
-    if calibration_file:
-        save_calibration(calibration_file, result.exposure, result.brightness)
-        result.saved = True
-        log('saved to %s' % calibration_file)
-    return result
-
-
-def _label(frame, separation, lines, rgb=False, long_side=1100):
-    """The frame scaled to ``long_side`` with its segment drawn and text lines on top. The frame and
-    the masks are scaled first and drawn on small: drawing on a 4024x3036 frame and scaling the
-    result took ~0.5 s a round. ``rgb``: the frame is RGB (Daheng), the image is BGR."""
-    h, w = frame.shape[:2]
-    scale = long_side / max(h, w)
-    size = (max(1, round(w * scale)), max(1, round(h * scale)))
-    vis = cv2.resize(frame, size, interpolation=cv2.INTER_AREA)
-    if rgb and vis.ndim == 3:
-        vis = cv2.cvtColor(vis, cv2.COLOR_RGB2BGR)
-
-    def small(mask):
-        return None if mask is None else cv2.resize(mask, size, interpolation=cv2.INTER_NEAREST)
-
-    vis = draw_overlay(vis, SimpleNamespace(garment_mask=small(separation.garment_mask),
-                                            ring_mask=small(separation.ring_mask)))
+        lines.append('%s   cue %s   area %.0f%%   contrast %.0f' % (
+            'VALID' if res.valid else 'NOT VALID', res.cue, res.stats.get('area_pct', 0.0),
+            res.stats.get('contrast', 0.0)))
+        if res.problems:
+            lines.append(res.problems[0])
     for i, text in enumerate(lines):
-        y = 32 + 30 * i
-        cv2.putText(vis, text, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 0, 0), 4, cv2.LINE_AA)
-        cv2.putText(vis, text, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 220, 0), 2, cv2.LINE_AA)
+        y = 30 + 28 * i
+        cv2.putText(vis, text, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 4, cv2.LINE_AA)
+        cv2.putText(vis, text, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 220, 0), 2, cv2.LINE_AA)
     return vis
 
 
-def _round_values(r):
-    return {'round': r.n, 'exposure': float(r.exposure),
-            'brightness': None if r.brightness is None else float(r.brightness),
-            'contrast': round(r.contrast, 1), 'solidity': round(r.solidity, 3),
-            'area_pct': round(float(r.separation.stats.get('area_pct', 0.0)), 1), 'action': r.action}
-
-
-def best_values(result):
-    """The kept round's exposure, brightness, contrast and segment, as a dict (None: no garment)."""
-    if result.best is None:
-        return None
-    values = _round_values(result.best)
-    values.pop('action')
-    values.update(best_round=values.pop('round'), cue=result.best.separation.cue,
-                  picked_by=result.picked_by, reason=result.reason)
-    return values
-
-
-def best_image(result, rgb=False, title='BEST'):
-    """The kept round's frame with its segment and its exposure, brightness and contrast written on it."""
-    b = result.best
-    return _label(b.frame, b.separation, [
-        '%s: exposure %d us   brightness %s' % (title, b.exposure, '-' if b.brightness is None else '%g' % b.brightness),
-        'contrast %.0f   solidity %.2f   area %.0f%%' % (b.contrast, b.solidity, b.separation.stats.get('area_pct', 0.0)),
-        'round %d, picked by %s' % (b.n, result.picked_by)], rgb=rgb)
-
-
-def save_run(result, folder, log_lines=(), rgb=False):
-    """Save one run to ``folder``: round<N>_<exposure>us.jpg for every round (its frame and segment),
-    BEST_round<N>.jpg and best.json (the kept round's exposure, brightness, contrast, solidity and
-    area, plus every round), and log.txt. ``rgb``: the frames are RGB (Daheng), the images are BGR."""
+def save(folder, raw, processed, vis):
+    """Save the raw frame, the processed frame and the overlay as BGR jpgs; returns the name prefix."""
     os.makedirs(folder, exist_ok=True)
-    for r in result.rounds:
-        cv2.imwrite(os.path.join(folder, 'round%d_%dus.jpg' % (r.n, r.exposure)), _label(
-            r.frame, r.separation,
-            ['round %d: exposure %d us   brightness %s' % (r.n, r.exposure,
-                                                          '-' if r.brightness is None else '%g' % r.brightness),
-             'contrast %.0f   solidity %.2f   area %.0f%%' % (r.contrast, r.solidity,
-                                                              r.separation.stats.get('area_pct', 0.0)),
-             '-> ' + r.action], rgb=rgb))
-    with open(os.path.join(folder, 'log.txt'), 'w') as f:
-        f.write('\n'.join(log_lines) + '\n')
-    data = {'time': time.strftime('%Y-%m-%dT%H:%M:%S'), 'best': best_values(result),
-            'rounds': [_round_values(r) for r in result.rounds]}
-    if result.best is None:
-        data['reason'] = result.reason
-    else:
-        cv2.imwrite(os.path.join(folder, 'BEST_round%d.jpg' % result.best.n), best_image(result, rgb))
-    with open(os.path.join(folder, 'best.json'), 'w') as f:
-        json.dump(data, f, indent=4)
-    return data
+    prefix = os.path.join(folder, time.strftime('%Y%m%d_%H%M%S'))
+    cv2.imwrite(prefix + '_raw.jpg', cv2.cvtColor(raw, cv2.COLOR_RGB2BGR))
+    cv2.imwrite(prefix + '_processed.jpg', cv2.cvtColor(processed, cv2.COLOR_RGB2BGR))
+    cv2.imwrite(prefix + '_overlay.jpg', vis)
+    return prefix
+
+
+def run_camera(once, out):
+    """Live window (or one frame with ``once``) of the camera with the garment separated."""
+    pre = PreProcessor(calibration_file=CALIBRATION_FILE)
+    edge_ok = pre.crop_bbox is not None         # cropped to the table: a garment may run off its sides
+    cam = WebcamCapture(calibration_file=CALIBRATION_FILE)
+    if not cam.start():
+        sys.exit('camera did not start (see the log above)')
+
+    try:
+        if once:
+            raw = wait_frame(cam)
+            if raw is None:
+                sys.exit('no frame from the camera')
+            processed, res = segment(raw, pre, edge_ok)
+            prefix = save(out, raw, processed, overlay(processed, res, cam))
+            print('valid=%s cue=%s area=%.1f%% contrast=%.0f problems=%s' % (
+                res.valid, res.cue, res.stats.get('area_pct', 0.0), res.stats.get('contrast', 0.0),
+                '; '.join(res.problems) or '-'))
+            print('saved %s_*.jpg' % prefix)
+            return
+
+        print('s = save, q = quit')
+        while True:
+            raw = wait_frame(cam)
+            if raw is None:
+                print('no frame from the camera')
+                break
+            processed, res = segment(raw, pre, edge_ok)
+            vis = overlay(processed, res, cam)
+            cv2.imshow('garment separation', vis)
+            key = cv2.waitKey(1) & 0xFF
+            if key in (ord('q'), 27):
+                break
+            if key == ord('s'):
+                print('saved %s_*.jpg' % save(out, raw, processed, vis))
+    finally:
+        cam.stop()
+        cv2.destroyAllWindows()
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Reference values and the camera with the garment separated.')
+    parser.add_argument('--once', action='store_true', help='one frame, no window: segment, save, exit')
+    parser.add_argument('--out', default=os.path.join(HERE, 'captures'), help='folder for saved images')
+    parser.add_argument('--reference', nargs='?', const=REFERENCE_IMAGE, metavar='IMAGE',
+                        help="print an image's exposure and brightness (default: the reference image)")
+    args = parser.parse_args()
+
+    if args.reference:
+        exposure, brightness = load_reference(args.reference)
+        print('brightness = %.1f' % brightness)
+        print('exposure   = %.2f' % exposure)
+        return
+    run_camera(args.once, args.out)
+
+
+if __name__ == '__main__':
+    main()
