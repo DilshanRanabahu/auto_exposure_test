@@ -56,16 +56,11 @@ def measure_reference(path=REFERENCE_IMAGE):
     if image is None:
         raise FileNotFoundError('reference image not found: %s' % path)
     res = separate_garment(image)
-    c, i = measure(image, res)
-    if i is None:
+    garment = garment_values(image, res)                # imread gives BGR
+    if garment is None:
         raise ValueError('no garment found in the reference image: %s' % '; '.join(res.problems))
-    values = {
-        'image': os.path.basename(path),
-        'brightness': round(i, 1),
-        'exposure': round(math.log2(max(i, 1.0) / MIDDLE_GREY), 2),
-        'contrast': round(c, 1),
-        'measured_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
-    }
+    values = {'image': os.path.basename(path), **garment,
+              'measured_at': time.strftime('%Y-%m-%dT%H:%M:%S')}
     return values, image, res
 
 
@@ -110,16 +105,23 @@ def segment(raw, pre, edge_ok):
     processed = pre.process_image(raw)
     return processed, separate_garment(processed, edge_ok=edge_ok)
 
-def measure(frame, res):
+
+def measure(frame, res, rgb=False):
     """(contrast c, intensity i) of a frame with its SeparationResult, or (None, None) without a garment.
 
     i = mean intensity of the detected garment
     c = mean intensity of the detected garment - mean intensity of the detected ring
         (negative: the garment is darker than the table around it)
+
+    ``rgb``: the frame is RGB (Daheng camera), else BGR (cv2.imread). The grey level then comes out the
+    same for the camera and the reference image.
     """
     if res.garment_mask is None or res.ring_mask is None:
         return None, None
-    gray = frame if frame.ndim == 2 else cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)   # as separate_garment
+    if frame.ndim == 2:
+        gray = frame
+    else:
+        gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY if rgb else cv2.COLOR_BGR2GRAY)
     garment_px, ring_px = gray[res.garment_mask > 0], gray[res.ring_mask > 0]
     if not garment_px.size or not ring_px.size:
         return None, None
@@ -128,24 +130,45 @@ def measure(frame, res):
     return c, i
 
 
+def garment_values(frame, res, rgb=False):
+    """The garment's brightness, exposure and contrast, as for the reference, or None without a garment.
+
+        brightness = mean intensity of the garment (0-255)
+        exposure   = log2(brightness / 118): stops from middle grey
+        contrast   = mean of the garment - mean of the ring
+    """
+    c, i = measure(frame, res, rgb)
+    if i is None:
+        return None
+    return {'brightness': round(i, 1),
+            'exposure': round(math.log2(max(i, 1.0) / MIDDLE_GREY), 2),
+            'contrast': round(c, 1)}
+
+
+def format_values(values):
+    """One line of garment_values for the window and the terminal."""
+    if values is None:
+        return 'brightness -   exposure -   contrast -'
+    return 'brightness %.1f   exposure %+.2f   contrast %+.1f' % (
+        values['brightness'], values['exposure'], values['contrast'])
+
+
 def overlay(processed, res, cam):
     """The processed frame (RGB from the Daheng camera, shown as BGR) with the segment and the values."""
     vis = draw_overlay(cv2.cvtColor(processed, cv2.COLOR_RGB2BGR), res)
     scale = DISPLAY_LONG_SIDE / max(vis.shape[:2])
     vis = cv2.resize(vis, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
-    lines = ['exposure %s us   brightness %s' % (cam.exposure, cam.gain)]
+    lines = ['camera: %s us, gain %s' % (cam.exposure, cam.gain)]
     if res.garment_mask is None:
         lines.append('no garment: %s' % '; '.join(res.problems[:1]))
     else:
-        c, i = measure(processed, res)
         lines.append('%s   cue %s   area %.0f%%' % (
             'VALID' if res.valid else 'NOT VALID', res.cue, res.stats.get('area_pct', 0.0)))
-        if c is not None:
-            lines.append('c = %.1f   i = %.1f' % (c, i))
+        lines.append(format_values(garment_values(processed, res, rgb=True)))
         if res.problems:
             lines.append(res.problems[0])
-    for i, text in enumerate(lines):
-        y = 30 + 28 * i
+    for n, text in enumerate(lines):
+        y = 30 + 28 * n
         cv2.putText(vis, text, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 4, cv2.LINE_AA)
         cv2.putText(vis, text, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 220, 0), 2, cv2.LINE_AA)
     return vis
@@ -176,10 +199,10 @@ def run_camera(once, out):
                 sys.exit('no frame from the camera')
             processed, res = segment(raw, pre, edge_ok)
             prefix = save(out, raw, processed, overlay(processed, res, cam))
-            c, i = measure(processed, res)
+            print('camera: %s us, gain %s' % (cam.exposure, cam.gain))
             print('valid=%s cue=%s area=%.1f%% problems=%s' % (
                 res.valid, res.cue, res.stats.get('area_pct', 0.0), '; '.join(res.problems) or '-'))
-            print('c = %s   i = %s' % ('-' if c is None else '%.1f' % c, '-' if i is None else '%.1f' % i))
+            print(format_values(garment_values(processed, res, rgb=True)))
             print('saved %s_*.jpg' % prefix)
             return
 
