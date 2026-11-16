@@ -19,7 +19,10 @@ Auto exposure (run_auto_exposure), the flowchart:
         Yes -> exposure kept
         No  -> gain locked; while |c| < MIN_CONTRAST the exposure goes down one step (x EXPOSURE_FACTOR),
                a new photo after every step. When |c| never gets there (exposure limit, MAX_ROUNDS
-               photos, or a photo without a garment) the photo with the largest |c| is kept.
+               photos, or |c| falling again after a garment was found) the photo with the largest
+               |c| is kept.
+    A segment that is NOT VALID, or runs along more than MAX_SIDE_CONTACT_PCT of a frame side, counts
+    as no garment (|c| = 0): see segment_problem.
     exposure locked; then the gain ("brightness" in the flowchart), one step at a time, a new photo
     after every step:
         i > HIGH_INTENSITY and i < MAX_INTENSITY -> set the gain, done
@@ -30,20 +33,28 @@ Auto exposure (run_auto_exposure), the flowchart:
     MAX_ROUNDS photos (both parts together) or a photo without a garment stops the gain loop and keeps
     the last good gain.
 
-    python auto_exposure.py                      # window: live frame with the garment separated
-    python auto_exposure.py --once               # one frame, no window: segment it, save it and exit
-    python auto_exposure.py --auto               # run the auto exposure once, save, set the camera, exit
-    python auto_exposure.py --reference          # measure image.png and save it to calibration.json
-    python auto_exposure.py --reference other.png --exposure 25000 --gain 12
+    python3 auto_exposure.py --check             # check the setup and save one segmented frame
+    python3 auto_exposure.py                     # window: live view; a = auto exposure, s = save, q = quit
+    python3 auto_exposure.py --once              # one frame, no window: segment it, save it and exit
+    python3 auto_exposure.py --auto              # run the auto exposure once, save, set the camera, exit
+    python3 auto_exposure.py --auto --no-save    # the same without writing calibration.json
+    python3 auto_exposure.py --reference         # measure image.png and save it to calibration.json
+    python3 auto_exposure.py --reference other.png --exposure 25000 --gain 12
                                                  # another reference image, shot at these settings
+    --calibration <file>                         # another calibration.json (default: the one here)
+    --out <folder>                               # where images go (default: captures/ here)
 
-Keys in the window:
-    s         save the raw frame, the processed frame and the overlay
-    q / Esc   quit
+On a production PC with the camera (Linux, Daheng SDK / gxipy installed):
 
-On a device stop the scanner app first (the camera can only be open in one process):
+    sudo systemctl stop rms-app                  # the camera can only be open in one process
+    cp <the device's calibration.json> .         # its crop and rotation are this camera's
+    python3 auto_exposure.py --reference         # the reference goes into that copy
+    python3 auto_exposure.py --check
+    python3 auto_exposure.py --auto              # or the window and 'a'
+    sudo systemctl start rms-app                 # when done
 
-    sudo systemctl stop rms-app
+Working on the copy keeps the scanner app's own calibration.json untouched. Every auto exposure run
+saves an image of each round and log.txt to <out>/auto_<time>/.
 """
 
 import argparse
@@ -67,6 +78,7 @@ DISPLAY_LONG_SIDE = 1100
 
 # Auto exposure: the exposure part (flowchart "No": the garment does not stand out more than the reference)
 MIN_CONTRAST = 20               # |c| below this: exposure down one step
+MAX_SIDE_CONTACT_PCT = 90.0     # a segment along more of one frame side than this is the table or the room
 EXPOSURE_FACTOR = 0.8           # one step: x0.8 (about 1/3 stop darker), the same at any exposure
 EXPOSURE_MIN_US = 2000          # the camera's own range narrows these when it is smaller
 EXPOSURE_MAX_US = 150000
@@ -113,7 +125,7 @@ def update_calibration(updates, calibration_file=CALIBRATION_FILE):
     os.replace(tmp, calibration_file)
 
 
-def measure_reference(path=REFERENCE_IMAGE, exposure_us=None, gain=None):
+def measure_reference(path=REFERENCE_IMAGE, exposure_us=None, gain=None, calibration_file=CALIBRATION_FILE):
     """Segment the reference image and measure its garment. Returns (values, image, SeparationResult).
 
     values: image, brightness (mean of the garment), exposure (log2(brightness / 118)), contrast
@@ -127,7 +139,7 @@ def measure_reference(path=REFERENCE_IMAGE, exposure_us=None, gain=None):
     garment = garment_values(image, res)                # imread gives BGR
     if garment is None:
         raise ValueError('no garment found in the reference image: %s' % '; '.join(res.problems))
-    calibration = read_calibration()
+    calibration = read_calibration(calibration_file)
     values = {'image': os.path.basename(path), **garment,
               'camera_exposure_us': float(exposure_us or calibration.get('exposure', DEFAULT_EXPOSURE_US)),
               'camera_gain': float(gain if gain is not None else calibration.get('gain', DEFAULT_GAIN)),
@@ -243,8 +255,9 @@ def overlay(processed, res, cam):
         lines.append('%s   cue %s   area %.0f%%' % (
             'VALID' if res.valid else 'NOT VALID', res.cue, res.stats.get('area_pct', 0.0)))
         lines.append(format_values(garment_values(processed, res, rgb=True)))
-        if res.problems:
-            lines.append(res.problems[0])
+        problem = segment_problem(res)
+        if problem:                                     # the auto exposure counts it as no garment
+            lines.append('NOT USED: ' + problem)
     for n, text in enumerate(lines):
         y = 30 + 28 * n
         cv2.putText(vis, text, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 4, cv2.LINE_AA)
@@ -345,6 +358,26 @@ def clamp(value, low, high):
     return min(high, max(low, value))
 
 
+def segment_problem(res):
+    """Why the auto exposure must not use this segment, or '' when it can. A segment it cannot use
+    counts as "no garment" (|c| = 0), so the flow lowers the exposure.
+
+    1. The separator calls it NOT VALID: on the test images every one of these was a wrong segment
+       (a print, a corner, a small blob).
+    2. It runs along more than MAX_SIDE_CONTACT_PCT of one frame side, even with a crop. On a device a
+       white shirt clipped into a white sheet; only the darker left edge of the sheet was left and was
+       taken as the garment (100% of the left side). Real garments that run off a side covered 47-55%.
+    """
+    if res is None or res.garment_mask is None:
+        return 'no garment'
+    if not res.valid:
+        return 'not valid: %s' % '; '.join(res.problems)
+    side = res.stats.get('side_contact_pct', 0.0)
+    if side > MAX_SIDE_CONTACT_PCT:
+        return 'along %.0f%% of a frame side: the table or the room' % side
+    return ''
+
+
 def contrast_size(values):
     """|c| of a photo. A photo without a garment counts as |c| = 0."""
     return 0.0 if values is None else abs(values['contrast'])
@@ -437,13 +470,18 @@ class AutoExposure:
 
         A photo without a garment counts as |c| = 0: a white garment on a white table clipped at 255
         is not found at all until the exposure is low enough to show its outline.
+        Once a garment was found, a lower |c| means the exposure went past its best: stop there.
         If |c| never reaches MIN_CONTRAST, the photo with the largest |c| is kept.
         Returns (values of the photo kept or None, note).
         """
         start_exposure = self.exposure
         first = len(self.rounds) - 1                    # this part's photos: self.rounds[first:]
+        best_size = contrast_size(values)               # the largest |c| so far (0: no garment yet)
 
         while contrast_size(values) < MIN_CONTRAST:
+            if best_size > 0 and contrast_size(values) < best_size:
+                stop = '|c| fell after it was %.1f' % best_size
+                break
             new_exposure = max(self.exposure_min, round(self.exposure * EXPOSURE_FACTOR))
             if new_exposure == self.exposure:
                 stop = 'exposure at its limit (%d us)' % self.exposure
@@ -456,6 +494,7 @@ class AutoExposure:
             self.rounds[-1]['action'] = why + ': exposure down'
             self.exposure = new_exposure
             values = self.take_photo()
+            best_size = max(best_size, contrast_size(values))
         else:
             # |c| reached MIN_CONTRAST: lock this exposure
             return values, '|c| = %.1f is not below %d at %d us' % (contrast_size(values), MIN_CONTRAST,
@@ -500,15 +539,18 @@ class AutoExposure:
         measure it. Records the round and returns its values (None: no garment)."""
         raw = next_frame(self.cam, apply_settings(self.cam, self.exposure, self.gain))
         values, processed, res = None, None, None
+        problem = 'no frame from the camera'
         if raw is not None:
             processed, res = segment(raw, self.pre, self.edge_ok)
-            values = garment_values(processed, res, rgb=True)
+            problem = segment_problem(res)
+            if not problem:                             # a segment it cannot use counts as no garment
+                values = garment_values(processed, res, rgb=True)
 
         r = {'round': len(self.rounds) + 1, 'exposure_us': self.exposure, 'gain': self.gain,
              'values': values, 'difference': difference(values, self.reference), 'action': ''}
         self.rounds.append(r)
         self.say('round %2d | %6d us | gain %4.1f | %s'
-                 % (r['round'], self.exposure, self.gain, format_values(values)))
+                 % (r['round'], self.exposure, self.gain, format_values(values) if values else problem))
         if self.out and processed is not None:
             os.makedirs(self.out, exist_ok=True)
             name = 'round%02d_%dus_gain%g.jpg' % (r['round'], self.exposure, self.gain)
@@ -553,34 +595,113 @@ def run_auto_exposure(cam, pre, edge_ok, reference, calibration_file=CALIBRATION
     return AutoExposure(cam, pre, edge_ok, reference, calibration_file, out, log).run()
 
 
-def run_camera(once, out, auto=False):
-    """Live window (or one frame with ``once``, or one auto exposure run with ``auto``) of the camera
-    with the garment separated."""
-    reference = load_reference() if auto else None
-    if auto and reference is None:
-        sys.exit('no reference in calibration.json: run  python auto_exposure.py --reference  first')
-    pre = PreProcessor(calibration_file=CALIBRATION_FILE)
+def open_camera(calibration_file):
+    """(camera, PreProcessor, edge_ok) for the Daheng camera with ``calibration_file``'s crop and settings."""
+    pre = PreProcessor(calibration_file=calibration_file)
     edge_ok = pre.crop_bbox is not None         # cropped to the table: a garment may run off its sides
-    cam = WebcamCapture(calibration_file=CALIBRATION_FILE)
+    cam = WebcamCapture(calibration_file=calibration_file)
     if not cam.start():
-        sys.exit('camera did not start (see the log above)')
+        sys.exit('camera did not start (see the log above). Is the scanner app still running? '
+                 '(sudo systemctl stop rms-app)')
     # The camera re-reads calibration.json on its first frame and would put the file's exposure and
     # gain back over the ones the auto exposure sets; mark the file as already read.
-    if os.path.exists(CALIBRATION_FILE):
-        cam.last_config_mtime = os.path.getmtime(CALIBRATION_FILE)
+    if os.path.exists(calibration_file):
+        cam.last_config_mtime = os.path.getmtime(calibration_file)
+    return cam, pre, edge_ok
+
+
+def crop_problem(pre, raw):
+    """Why the calibration crop does not fit this camera's frames, or '' when it does."""
+    if pre.crop_bbox is None:
+        return ''
+    (x0, y0), (x1, y1) = pre.crop_bbox
+    h, w = raw.shape[:2]
+    if max(x0, x1) > w or max(y0, y1) > h:
+        return ('the crop %s is outside the %dx%d frame: calibration.json is from another camera or '
+                'resolution' % (pre.crop_bbox, w, h))
+    return ''
+
+
+def auto_once(cam, pre, edge_ok, reference, calibration_file, out):
+    """One auto exposure run with every round saved to ``out``; prints the result."""
+    result = run_auto_exposure(cam, pre, edge_ok, reference, calibration_file=calibration_file, out=out)
+    print('result: %d us, gain %g (%d photos)%s' % (
+        result['exposure_us'], result['gain'], len(result['rounds']),
+        '' if result['saved'] else ', NOT saved'))
+    print('rounds saved to %s' % out)
+    return result
+
+
+def check_setup(calibration_file, out):
+    """Check everything a device run needs, step by step, and save one segmented frame."""
+    def line(ok, text):
+        print('[%s] %s' % ('OK  ' if ok else 'FAIL', text))
+        return ok
+
+    line(True, 'python %s, opencv %s' % (sys.version.split()[0], cv2.__version__))
+    try:
+        import gxipy  # noqa: F401  (Daheng SDK)
+        line(True, 'gxipy found')
+    except ImportError as e:
+        return line(False, 'gxipy not found (%s): install the Daheng SDK' % e)
+
+    calibration = read_calibration(calibration_file)
+    if not line(bool(calibration), 'calibration file %s' % calibration_file):
+        return False
+    line(True, 'camera settings in it: exposure %s us, gain %s; crop %s' % (
+        calibration.get('exposure'), calibration.get('gain'), calibration.get('crop_bbox')))
+    reference = calibration.get(REFERENCE_KEY)
+    if reference is None:
+        return line(False, 'reference missing: run  python3 auto_exposure.py --reference  first')
+    line(True, 'reference: %s, start at %s us, gain %s' % (
+        format_values(reference), reference.get('camera_exposure_us'), reference.get('camera_gain')))
+
+    cam, pre, edge_ok = open_camera(calibration_file)
+    try:
+        raw = wait_frame(cam)
+        if raw is None:
+            return line(False, 'camera started but no frame came')
+        line(True, 'camera started, frame %dx%d' % (raw.shape[1], raw.shape[0]))
+        problem = crop_problem(pre, raw)
+        if not line(not problem, problem or 'crop fits the frame'):
+            return False
+        processed, res = segment(raw, pre, edge_ok)
+        values = garment_values(processed, res, rgb=True)
+        line(values is not None, 'garment: %s, cue %s, area %.0f%%%s' % (
+            'VALID' if res.valid else 'NOT VALID', res.cue, res.stats.get('area_pct', 0.0),
+            '' if res.valid else ' (%s)' % '; '.join(res.problems)))
+        print('       %s' % format_values(values))
+        if values is not None:
+            print('       flowchart: %s' % ('Yes' if contrast_above_reference(values, reference) else 'No'))
+        print('       frame saved: %s_*.jpg' % save(out, raw, processed, overlay(processed, res, cam)))
+    finally:
+        cam.stop()
+    return True
+
+
+def run_camera(mode, out, calibration_file=CALIBRATION_FILE, save_result=True):
+    """mode 'live': window, 'a' runs the auto exposure; 'once': one frame segmented and saved;
+    'auto': one auto exposure run. ``save_result`` False: the auto exposure never writes calibration.json."""
+    reference = load_reference(calibration_file)
+    if mode == 'auto' and reference is None:
+        sys.exit('no reference in %s: run  python3 auto_exposure.py --reference  first' % calibration_file)
+    target = calibration_file if save_result else None
+    cam, pre, edge_ok = open_camera(calibration_file)
 
     try:
-        if auto:
-            if wait_frame(cam) is None:
-                sys.exit('no frame from the camera')
-            run_auto_exposure(cam, pre, edge_ok, reference,
-                              out=os.path.join(out, 'auto_' + time.strftime('%Y%m%d_%H%M%S')))
+        raw = wait_frame(cam)
+        if raw is None:
+            sys.exit('no frame from the camera')
+        problem = crop_problem(pre, raw)
+        if problem:
+            sys.exit(problem)
+
+        if mode == 'auto':
+            auto_once(cam, pre, edge_ok, reference, target,
+                      os.path.join(out, 'auto_' + time.strftime('%Y%m%d_%H%M%S')))
             return
 
-        if once:
-            raw = wait_frame(cam)
-            if raw is None:
-                sys.exit('no frame from the camera')
+        if mode == 'once':
             processed, res = segment(raw, pre, edge_ok)
             prefix = save(out, raw, processed, overlay(processed, res, cam))
             print('camera: %s us, gain %s' % (cam.exposure, cam.gain))
@@ -590,7 +711,7 @@ def run_camera(once, out, auto=False):
             print('saved %s_*.jpg' % prefix)
             return
 
-        print('s = save, q = quit')
+        print('a = auto exposure, s = save, q = quit')
         while True:
             raw = wait_frame(cam)
             if raw is None:
@@ -604,6 +725,12 @@ def run_camera(once, out, auto=False):
                 break
             if key == ord('s'):
                 print('saved %s_*.jpg' % save(out, raw, processed, vis))
+            if key == ord('a'):
+                if reference is None:
+                    print('no reference in %s: run  --reference  first' % calibration_file)
+                    continue
+                auto_once(cam, pre, edge_ok, reference, target,
+                          os.path.join(out, 'auto_' + time.strftime('%Y%m%d_%H%M%S')))
     finally:
         cam.stop()
         cv2.destroyAllWindows()
@@ -611,7 +738,14 @@ def run_camera(once, out, auto=False):
 
 def main():
     parser = argparse.ArgumentParser(description='Reference values and the camera with the garment separated.')
+    parser.add_argument('--check', action='store_true',
+                        help='check the setup (SDK, calibration, reference, camera, crop) and save one frame')
     parser.add_argument('--once', action='store_true', help='one frame, no window: segment, save, exit')
+    parser.add_argument('--auto', action='store_true',
+                        help='run the auto exposure once from the reference, save and set it, exit')
+    parser.add_argument('--no-save', action='store_true', help='the auto exposure never writes calibration.json')
+    parser.add_argument('--calibration', default=CALIBRATION_FILE,
+                        help='calibration.json to use (crop, settings, reference; default: the copy in this folder)')
     parser.add_argument('--out', default=os.path.join(HERE, 'captures'), help='folder for saved images')
     parser.add_argument('--reference', nargs='?', const=REFERENCE_IMAGE, metavar='IMAGE',
                         help='segment a reference image, measure its garment and save it to calibration.json '
@@ -619,27 +753,29 @@ def main():
     parser.add_argument('--exposure', type=float, help='--reference: exposure (us) the image was shot at '
                                                        '(default: calibration.json)')
     parser.add_argument('--gain', type=float, help='--reference: gain the image was shot at (default: calibration.json)')
-    parser.add_argument('--auto', action='store_true',
-                        help='run the auto exposure once from the reference, save and set it, exit')
     args = parser.parse_args()
+    calibration_file = os.path.abspath(args.calibration)
 
     if args.reference:
         try:
-            values, image, res = measure_reference(args.reference, args.exposure, args.gain)
+            values, image, res = measure_reference(args.reference, args.exposure, args.gain, calibration_file)
         except (FileNotFoundError, ValueError) as e:
             sys.exit(str(e))
         if not res.valid:
             print('warning: the segment is not valid (%s)' % '; '.join(res.problems))
         for key, value in values.items():
-            print('%-12s %s' % (key, value))
-        save_reference(values)
-        print('saved to %s under "%s"' % (CALIBRATION_FILE, REFERENCE_KEY))
+            print('%-18s %s' % (key, value))
+        save_reference(values, calibration_file)
+        print('saved to %s under "%s"' % (calibration_file, REFERENCE_KEY))
         os.makedirs(args.out, exist_ok=True)
         path = os.path.join(args.out, 'reference_overlay.jpg')
         cv2.imwrite(path, draw_overlay(image, res))     # imread gives BGR: no conversion
         print('segment: %s' % path)
         return
-    run_camera(args.once, args.out, args.auto)
+    if args.check:
+        sys.exit(0 if check_setup(calibration_file, args.out) else 1)
+    mode = 'auto' if args.auto else 'once' if args.once else 'live'
+    run_camera(mode, args.out, calibration_file, save_result=not args.no_save)
 
 
 if __name__ == '__main__':
