@@ -145,6 +145,25 @@ def garment_values(frame, res, rgb=False):
             'contrast': round(c, 1)}
 
 
+def difference(camera, reference):
+    """Reference minus camera, or None when either is missing (no garment, or no reference saved yet).
+
+    ``camera`` is garment_values() of a camera frame, ``reference`` is load_reference().
+
+        brightness = reference brightness - camera brightness   (+: the camera's garment is darker)
+        exposure   = reference exposure - camera exposure       (stops; +: the camera's garment is darker)
+        contrast   = |reference contrast| - |camera contrast|   (+: the camera's garment stands out less)
+
+    The contrast uses its size only: a dark garment on a light table and a light one on a dark table
+    have opposite signs but can stand out just as much.
+    """
+    if camera is None or reference is None:
+        return None
+    return {'brightness': round(reference['brightness'] - camera['brightness'], 1),
+            'exposure': round(reference['exposure'] - camera['exposure'], 2),
+            'contrast': round(abs(reference['contrast']) - abs(camera['contrast']), 1)}
+
+
 def format_values(values):
     """One line of garment_values for the window and the terminal."""
     if values is None:
