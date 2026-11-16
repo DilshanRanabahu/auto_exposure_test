@@ -1,17 +1,18 @@
 """Auto exposure: the reference image's values, and the camera frame with the garment separated.
 
-Reference: measured from REFERENCE_IMAGE when this file is loaded, so a new reference image
-changes the values on its own. Whole image, no segmentation.
+Reference: the reference image (image.png) is segmented and measured on the garment only, and the
+values are saved in calibration.json under "reference_image" (the other keys are kept):
 
-    brightness = mean grey level of the image (0-255)
+    brightness = mean intensity of the garment (0-255)
     exposure   = log2(brightness / 118): stops from middle grey (0 = middle grey, + brighter, - darker)
+    contrast   = mean of the garment - mean of the ring of table around it
 
 Camera: camera -> PreProcessor (rotate, crop, undistort from calibration.json) -> separate_garment
 
     python auto_exposure.py                      # window: live frame with the garment separated
     python auto_exposure.py --once               # one frame, no window: segment it, save it and exit
-    python auto_exposure.py --reference          # print the reference image's values
-    python auto_exposure.py --reference other.png  # print another image's values
+    python auto_exposure.py --reference          # measure image.png and save it to calibration.json
+    python auto_exposure.py --reference other.png  # the same with another reference image
 
 Keys in the window:
     s         save the raw frame, the processed frame and the overlay
@@ -23,6 +24,7 @@ On a device stop the scanner app first (the camera can only be open in one proce
 """
 
 import argparse
+import json
 import math
 import os
 import sys
@@ -36,6 +38,7 @@ from garment_separation import draw_overlay, separate_garment
 HERE = os.path.dirname(os.path.abspath(__file__))
 CALIBRATION_FILE = os.path.join(HERE, 'calibration.json')
 REFERENCE_IMAGE = os.path.join(HERE, 'image.png')
+REFERENCE_KEY = 'reference_image'    # the reference's key in calibration.json
 MIDDLE_GREY = 118
 DISPLAY_LONG_SIDE = 1100
 
@@ -43,24 +46,49 @@ DISPLAY_LONG_SIDE = 1100
 # =========================================================================================
 # Reference
 # =========================================================================================
-def image_values(image):
-    """(exposure, brightness) of a BGR or grey image."""
-    gray = image if image.ndim == 2 else cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    brightness = float(gray.mean())
-    exposure = math.log2(max(brightness, 1.0) / MIDDLE_GREY)
-    return exposure, brightness
+def measure_reference(path=REFERENCE_IMAGE):
+    """Segment the reference image and measure its garment. Returns (values, image, SeparationResult).
 
-
-def load_reference(path=REFERENCE_IMAGE):
-    """(exposure, brightness) of the reference image."""
+    values: image, brightness (mean of the garment), exposure (log2(brightness / 118)), contrast
+    (garment - ring) and measured_at. Raises when the image cannot be read or has no garment.
+    """
     image = cv2.imread(path)
     if image is None:
         raise FileNotFoundError('reference image not found: %s' % path)
-    return image_values(image)
+    res = separate_garment(image)
+    c, i = measure(image, res)
+    if i is None:
+        raise ValueError('no garment found in the reference image: %s' % '; '.join(res.problems))
+    values = {
+        'image': os.path.basename(path),
+        'brightness': round(i, 1),
+        'exposure': round(math.log2(max(i, 1.0) / MIDDLE_GREY), 2),
+        'contrast': round(c, 1),
+        'measured_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
+    }
+    return values, image, res
 
 
-# Reference (measured from image.png when this file is loaded)
-REFERENCE_EXPOSURE, REFERENCE_BRIGHTNESS = load_reference()
+def save_reference(values, calibration_file=CALIBRATION_FILE):
+    """Write ``values`` into calibration.json under REFERENCE_KEY, keeping every other key.
+    Atomic: written to a .tmp file first and moved over the old one."""
+    data = {}
+    if os.path.exists(calibration_file):
+        with open(calibration_file, 'r') as f:
+            data = json.load(f)
+    data[REFERENCE_KEY] = values
+    tmp = calibration_file + '.tmp'
+    with open(tmp, 'w') as f:
+        json.dump(data, f, indent=4)
+    os.replace(tmp, calibration_file)
+
+
+def load_reference(calibration_file=CALIBRATION_FILE):
+    """The reference values saved in calibration.json, or None when there are none yet."""
+    if not os.path.exists(calibration_file):
+        return None
+    with open(calibration_file, 'r') as f:
+        return json.load(f).get(REFERENCE_KEY)
 
 
 # =========================================================================================
@@ -179,13 +207,25 @@ def main():
     parser.add_argument('--once', action='store_true', help='one frame, no window: segment, save, exit')
     parser.add_argument('--out', default=os.path.join(HERE, 'captures'), help='folder for saved images')
     parser.add_argument('--reference', nargs='?', const=REFERENCE_IMAGE, metavar='IMAGE',
-                        help="print an image's exposure and brightness (default: the reference image)")
+                        help='segment a reference image, measure its garment and save it to calibration.json '
+                             '(default: image.png)')
     args = parser.parse_args()
 
     if args.reference:
-        exposure, brightness = load_reference(args.reference)
-        print('brightness = %.1f' % brightness)
-        print('exposure   = %.2f' % exposure)
+        try:
+            values, image, res = measure_reference(args.reference)
+        except (FileNotFoundError, ValueError) as e:
+            sys.exit(str(e))
+        if not res.valid:
+            print('warning: the segment is not valid (%s)' % '; '.join(res.problems))
+        for key, value in values.items():
+            print('%-12s %s' % (key, value))
+        save_reference(values)
+        print('saved to %s under "%s"' % (CALIBRATION_FILE, REFERENCE_KEY))
+        os.makedirs(args.out, exist_ok=True)
+        path = os.path.join(args.out, 'reference_overlay.jpg')
+        cv2.imwrite(path, draw_overlay(image, res))     # imread gives BGR: no conversion
+        print('segment: %s' % path)
         return
     run_camera(args.once, args.out)
 

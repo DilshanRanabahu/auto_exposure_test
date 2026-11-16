@@ -179,5 +179,12 @@
     "pose_charuco_corner_count": 54,
     "pose_saved_by": "User A",
     "a4_verification": null,
-    "calibration_completed": "2026-10-30T18:15:48.997985"
+    "calibration_completed": "2026-10-30T18:15:48.997985",
+    "reference_image": {
+        "image": "image.png",
+        "brightness": 71.5,
+        "exposure": -0.72,
+        "contrast": -183.5,
+        "measured_at": "2026-11-13T15:51:25"
+    }
 }
