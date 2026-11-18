@@ -1,8 +1,16 @@
 """Auto exposure (new flowchart).
 
-Step 1: the reference.
+    python3 auto_exposure_new.py                           # run the auto exposure on the camera, then a
+                                                           # window: a = run it again, q = quit
     python3 auto_exposure_new.py --reference               # measure image.png, save to calibration.json
     python3 auto_exposure_new.py --reference other.png     # another reference image
+
+On a production PC (Linux, Daheng SDK / gxipy installed):
+    sudo systemctl stop rms-app                            # the camera can only be open in one process
+    python3 auto_exposure_new.py
+    sudo systemctl start rms-app
+
+The reference:
 
 The reference image is segmented (garment + ring of table around it) and these values are saved in
 calibration.json under "reference_image" (every other key in the file is kept):
@@ -21,6 +29,7 @@ import time
 
 import cv2  # type: ignore
 
+from capture import PreProcessor, WebcamCapture
 from garment_separation import draw_overlay, separate_garment
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -305,6 +314,36 @@ def main():
 
     if args.reference:
         save_reference(args.reference, CALIBRATION_FILE)
+        return
+
+    # No option: run the auto exposure once on the Daheng camera
+    pre = PreProcessor(calibration_file=CALIBRATION_FILE)
+    cam = WebcamCapture(calibration_file=CALIBRATION_FILE)
+    if not cam.start():
+        print('camera did not start.')
+        return
+    # the camera re-reads calibration.json on its first frame; mark it as read so it does not put
+    # the file's exposure and gain back over the ones the auto exposure sets
+    cam.last_config_mtime = os.path.getmtime(CALIBRATION_FILE)
+    try:
+        run_auto_exposure(cam, pre)
+
+        # live view: a = run the auto exposure again, q = quit
+        print('a = run the auto exposure again, q = quit')
+        while True:
+            frame = cam.get_latest_image()
+            if frame is not None:
+                view = cv2.cvtColor(pre.process_image(frame), cv2.COLOR_RGB2BGR)   # Daheng frames are RGB
+                scale = 1000 / max(view.shape[:2])
+                cv2.imshow('auto exposure', cv2.resize(view, None, fx=scale, fy=scale))
+            key = cv2.waitKey(30) & 0xFF
+            if key == ord('a'):
+                run_auto_exposure(cam, pre)
+            if key == ord('q'):
+                break
+    finally:
+        cam.stop()
+        cv2.destroyAllWindows()
 
 
 if __name__ == '__main__':
