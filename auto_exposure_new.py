@@ -50,6 +50,13 @@ GAIN_MIN = 0.0
 GAIN_MAX = 24.0
 MAX_PHOTOS = 12                 # photos in one run, the first one included
 
+# Low-contrast exposure search (flowchart "No")
+CLIPPED_LEVEL = 200             # clipped: the brighter of fabric mean and table mean is above this
+MIN_STEP_US = 500               # the exposure step halves every photo; below this: stop and flag the operator
+EXPOSURE_MIN_US = 2000
+EXPOSURE_MAX_US = 150000
+MAX_SIDE_CONTACT_PCT = 90.0     # a segment along more of one frame side than this is the table, not a garment
+
 # Waiting for a frame shot at new settings: the Daheng camera keeps delivering frames at the old
 # settings for a while (up to 1-2 s) after a change.
 SETTLE_S = 0.2                  # always wait this long first
@@ -128,6 +135,42 @@ def load_reference(calibration_file):
     return read_calibration(calibration_file).get(REFERENCE_KEY)
 
 
+def camera_gray(cam, pre):
+    """The camera's latest frame, prepared like the scanner app (rotate, crop, undistort), as
+    (processed frame, grey frame). (None, None) when no frame comes within 5 s."""
+    frame = None
+    for _ in range(250):                        # up to 5 s for a frame (camera just started)
+        frame = cam.get_latest_image()
+        if frame is not None:
+            break
+        time.sleep(0.02)
+    if frame is None:
+        print('no frame from the camera')
+        return None, None
+    processed = pre.process_image(frame)
+    gray = cv2.cvtColor(processed, cv2.COLOR_RGB2GRAY)     # Daheng frames are RGB
+    return processed, gray
+
+
+def segment_camera(cam, pre):
+    """Separate the garment in the camera's latest frame. Returns (gray, garment_mask, ring_mask);
+    the masks are None when there is no garment, or the segment runs along more than
+    MAX_SIDE_CONTACT_PCT of one frame side (that is the table or a sheet edge, not a garment)."""
+    processed, gray = camera_gray(cam, pre)
+    if gray is None:
+        return None, None, None
+    edge_ok = pre.crop_bbox is not None         # cropped to the table: a garment may run off its sides
+    res = separate_garment(processed, edge_ok=edge_ok)
+    if res.garment_mask is None or res.ring_mask is None:
+        print('no garment found: %s' % '; '.join(res.problems))
+        return gray, None, None
+    side = res.stats.get('side_contact_pct', 0.0)
+    if side > MAX_SIDE_CONTACT_PCT:
+        print('segment along %.0f%% of a frame side: the table, not a garment' % side)
+        return gray, None, None
+    return gray, res.garment_mask, res.ring_mask
+
+
 def measure_camera_garment(cam, pre):
     """Flowchart: "Detect garment and ring, measure contrast C and fabric mean".
 
@@ -140,24 +183,10 @@ def measure_camera_garment(cam, pre):
 
     The same measurement as the reference. Returns (None, None, None) when there is no frame or no garment.
     """
-    frame = None
-    for _ in range(250):                        # up to 5 s for a frame (camera just started)
-        frame = cam.get_latest_image()
-        if frame is not None:
-            break
-        time.sleep(0.02)
-    if frame is None:
-        print('no frame from the camera')
+    gray, garment_mask, ring_mask = segment_camera(cam, pre)
+    if garment_mask is None:
         return None, None, None
-
-    processed = pre.process_image(frame)
-    edge_ok = pre.crop_bbox is not None         # cropped to the table: a garment may run off its sides
-    res = separate_garment(processed, edge_ok=edge_ok)
-    gray = cv2.cvtColor(processed, cv2.COLOR_RGB2GRAY)     # Daheng frames are RGB
-    values = garment_values(gray, res.garment_mask, res.ring_mask)
-    if values is None:
-        print('no garment found: %s' % '; '.join(res.problems))
-        return None, None, None
+    values = garment_values(gray, garment_mask, ring_mask)
     return values['contrast'], values['brightness'], values['exposure']
 
 
@@ -180,9 +209,8 @@ def frame_level(frame):
     return float(frame[::8, ::8].mean())
 
 
-def take_photo(cam, pre, exposure, gain):
-    """Set the exposure and gain, wait for a frame shot at them, and measure the garment.
-    Returns (contrast, brightness, exposure) like measure_camera_garment.
+def set_and_wait(cam, exposure, gain):
+    """Set the exposure and gain on the camera and wait until its frames are shot at them.
 
     Brightness follows exposure and gain, so the expected level of the new frames is known. A frame
     that has moved CHANGE_SEEN of the way towards it is shot at the new settings. When the change is
@@ -215,6 +243,11 @@ def take_photo(cam, pre, exposure, gain):
                 break
         time.sleep(0.01)
 
+
+def take_photo(cam, pre, exposure, gain):
+    """Set the exposure and gain, wait for a frame shot at them, and measure the garment.
+    Returns (contrast, brightness, exposure) like measure_camera_garment."""
+    set_and_wait(cam, exposure, gain)
     contrast, brightness, stops = measure_camera_garment(cam, pre)
     if contrast is None:
         print('photo: %d us, gain %g -> no garment' % (exposure, gain))
@@ -224,7 +257,8 @@ def take_photo(cam, pre, exposure, gain):
 
 
 def brightness_loop(cam, pre, exposure, gain, contrast, brightness, photos):
-    """Flowchart: the brightness loop, with the exposure locked. Returns the gain to set.
+    """Flowchart: the brightness loop, with the exposure locked. Returns (gain to set, contrast C
+    measured at that gain).
 
         fabric mean > 60 and < 200  -> stop here
         fabric mean > 60 and >= 200 -> gain down one step, new photo, check again
@@ -235,11 +269,12 @@ def brightness_loop(cam, pre, exposure, gain, contrast, brightness, photos):
     are done, or a photo after a step has no garment.
     """
     previous_gain = None                        # the gain before the last step (None: no step yet)
+    previous_contrast = None                    # the contrast at previous_gain
     while True:
         if brightness > HIGH_BRIGHTNESS:
             if brightness < MAX_BRIGHTNESS:
                 print('fabric mean %.1f is in %d-%d: gain %g' % (brightness, HIGH_BRIGHTNESS, MAX_BRIGHTNESS, gain))
-                return gain
+                return gain, contrast
             step = -GAIN_STEP                   # fabric mean >= 200: gain down
         elif brightness < MIN_BRIGHTNESS:
             step = +GAIN_STEP                   # fabric mean < 20: gain up
@@ -247,25 +282,88 @@ def brightness_loop(cam, pre, exposure, gain, contrast, brightness, photos):
             # final check
             if abs(contrast) < MIN_CONTRAST and previous_gain is not None:
                 print('final check: |C| = %.1f < %d, gain back to %g' % (abs(contrast), MIN_CONTRAST, previous_gain))
-                return previous_gain
+                return previous_gain, previous_contrast
             print('fabric mean %.1f, final check passed: gain %g' % (brightness, gain))
-            return gain
+            return gain, contrast
 
         new_gain = min(GAIN_MAX, max(GAIN_MIN, gain + step))
         if new_gain == gain:
             print('gain at its limit (%g): stop' % gain)
-            return gain
+            return gain, contrast
         if photos >= MAX_PHOTOS:
             print('%d photos done: stop at gain %g' % (MAX_PHOTOS, gain))
-            return gain
+            return gain, contrast
 
         new_contrast, new_brightness, _ = take_photo(cam, pre, exposure, new_gain)
         photos += 1
         if new_contrast is None:
             print('no garment at gain %g: back to gain %g' % (new_gain, gain))
-            return gain
+            return gain, contrast
         previous_gain, gain = gain, new_gain
+        previous_contrast = contrast
         contrast, brightness = new_contrast, new_brightness
+
+
+def low_contrast_search(cam, pre, exposure, gain, photos):
+    """Flowchart "No": the low-contrast exposure search, with the brightness (gain) locked.
+
+    The garment and ring masks are saved once (from the photo at the reference's settings) and every
+    new photo is measured on them, without separating again. step = half the exposure, then:
+
+        |C| >= 15       -> the exposure is found
+        clipped         -> exposure - step     (clipped: the brighter of fabric mean and table mean > 200)
+        not clipped     -> exposure + step
+        then the step halves; step below MIN_STEP_US -> stop and flag the operator
+
+    No garment in the first photo: the exposure is halved and the garment separated again until one is
+    found (a clipped white garment on a white table has no outline).
+
+    Returns (exposure, contrast, fabric mean, photos); exposure None means stop and flag the operator.
+    """
+    # the saved mask
+    gray, garment_mask, ring_mask = segment_camera(cam, pre)
+    while garment_mask is None:
+        new_exposure = max(EXPOSURE_MIN_US, round(exposure * 0.5))
+        if new_exposure == exposure or photos >= MAX_PHOTOS:
+            print('no garment found down to %d us' % exposure)
+            return None, None, None, photos
+        exposure = new_exposure
+        set_and_wait(cam, exposure, gain)
+        photos += 1
+        gray, garment_mask, ring_mask = segment_camera(cam, pre)
+        print('photo: %d us, gain %g -> %s' % (exposure, gain, 'garment found' if garment_mask is not None
+                                                            else 'no garment'))
+
+    step = exposure / 2
+    while True:
+        # measure C, fabric mean and table mean on the saved mask
+        fabric = float(gray[garment_mask > 0].mean())
+        table = float(gray[ring_mask > 0].mean())
+        contrast = fabric - table
+        print('  saved mask at %d us: C %.1f, fabric %.1f, table %.1f' % (exposure, contrast, fabric, table))
+
+        if abs(contrast) >= MIN_CONTRAST:
+            return exposure, contrast, fabric, photos
+
+        if max(fabric, table) > CLIPPED_LEVEL:
+            exposure = exposure - step          # clipped: darker
+        else:
+            exposure = exposure + step          # not clipped: brighter
+        exposure = round(min(EXPOSURE_MAX_US, max(EXPOSURE_MIN_US, exposure)))
+        step = step / 2
+
+        if step < MIN_STEP_US:
+            print('step %.0f us is below %d us' % (step, MIN_STEP_US))
+            return None, None, None, photos
+        if photos >= MAX_PHOTOS:
+            print('%d photos done' % MAX_PHOTOS)
+            return None, None, None, photos
+
+        set_and_wait(cam, exposure, gain)
+        photos += 1
+        _, gray = camera_gray(cam, pre)
+        if gray is None:
+            return None, None, None, photos
 
 
 def set_and_save(cam, exposure, gain):
@@ -282,13 +380,44 @@ def set_and_save(cam, exposure, gain):
     print('set and saved: %d us, gain %g' % (exposure, gain))
 
 
+def print_result(exposure, gain, contrast, saved, seconds):
+    """The values set at the end of a run, the garment's contrast C at them (None: not found) and
+    the time the whole run took."""
+    bar = '=' * 50
+    print('')
+    print(bar)
+    print(' AUTO EXPOSURE RESULT')
+    print(bar)
+    print('  exposure : %d us' % exposure)
+    print('  gain     : %g' % gain)
+    print('  contrast : %s' % ('-' if contrast is None else '%.1f' % contrast))
+    print('  saved    : %s' % ('yes, calibration.json' if saved else 'NO (calibration.json not changed)'))
+    print('  time     : %.1f s' % seconds)
+    print(bar)
+
+
+def flag_operator(cam, reference, start):
+    """Flowchart: "Stop and flag the operator". The camera goes back to the reference's settings and
+    nothing is saved."""
+    exposure = float(reference['camera_exposure_us'])
+    gain = float(reference['camera_gain'])
+    cam.set_exposure(exposure)
+    cam.set_gain(gain)
+    print('')
+    print('!!! OPERATOR: no exposure gives this garment enough contrast against the table.')
+    print('!!! Camera back to the reference settings, calibration.json not changed.')
+    print_result(exposure, gain, None, False, time.time() - start)
+
+
 def run_auto_exposure(cam, pre):
     """The flowchart from the top: photo at the reference's settings, contrast above the reference?
-    Yes: lock the exposure, brightness loop, set and save. No: not written yet."""
+    Yes: lock the exposure. No: low-contrast exposure search (gain locked), then lock the exposure it
+    found, or stop and flag the operator. Then the brightness loop, set and save."""
     reference = load_reference(CALIBRATION_FILE)
     if reference is None:
         print('no reference in calibration.json: run  --reference  first')
         return
+    start = time.time()
     exposure = float(reference['camera_exposure_us'])
     gain = float(reference['camera_gain'])
 
@@ -296,14 +425,23 @@ def run_auto_exposure(cam, pre):
     contrast, brightness, _ = take_photo(cam, pre, exposure, gain)
     photos = 1
 
-    if not contrast_above_reference(contrast, reference):
-        print('contrast not above the reference: the low-contrast exposure search is not written yet')
+    # Contrast above reference?
+    if contrast_above_reference(contrast, reference):
+        print('Yes: exposure locked at %d us' % exposure)
+    else:
+        print('No: low-contrast exposure search, gain locked at %g' % gain)
+        exposure, contrast, brightness, photos = low_contrast_search(cam, pre, exposure, gain, photos)
+
+    # the search found no exposure: stop and flag the operator
+    if exposure is None:
+        flag_operator(cam, reference, start)
         return
 
-    # Yes: lock the exposure, then the brightness loop
-    print('contrast above the reference: exposure locked at %d us' % exposure)
-    gain = brightness_loop(cam, pre, exposure, gain, contrast, brightness, photos)
+    # exposure locked: brightness loop, set and save
+    print('exposure locked at %d us' % exposure)
+    gain, contrast = brightness_loop(cam, pre, exposure, gain, contrast, brightness, photos)
     set_and_save(cam, exposure, gain)
+    print_result(exposure, gain, contrast, True, time.time() - start)
 
 
 def main():
