@@ -102,6 +102,39 @@ def load_reference(calibration_file):
     return read_calibration(calibration_file).get(REFERENCE_KEY)
 
 
+def measure_camera_garment(cam, pre):
+    """Flowchart: "Detect garment and ring, measure contrast C and fabric mean".
+
+    Takes the camera's latest frame, prepares it like the scanner app (rotate, crop, undistort),
+    separates the garment and the ring of table around it, and returns (contrast, brightness, exposure):
+
+        contrast   = mean of the garment - mean of the ring (C)
+        brightness = mean intensity of the garment, 0-255 (fabric mean)
+        exposure   = log2(brightness / 118): stops from middle grey
+
+    The same measurement as the reference. Returns (None, None, None) when there is no frame or no garment.
+    """
+    frame = None
+    for _ in range(250):                        # up to 5 s for a frame (camera just started)
+        frame = cam.get_latest_image()
+        if frame is not None:
+            break
+        time.sleep(0.02)
+    if frame is None:
+        print('no frame from the camera')
+        return None, None, None
+
+    processed = pre.process_image(frame)
+    edge_ok = pre.crop_bbox is not None         # cropped to the table: a garment may run off its sides
+    res = separate_garment(processed, edge_ok=edge_ok)
+    gray = cv2.cvtColor(processed, cv2.COLOR_RGB2GRAY)     # Daheng frames are RGB
+    values = garment_values(gray, res.garment_mask, res.ring_mask)
+    if values is None:
+        print('no garment found: %s' % '; '.join(res.problems))
+        return None, None, None
+    return values['contrast'], values['brightness'], values['exposure']
+
+
 def main():
     parser = argparse.ArgumentParser(description='Auto exposure (new flowchart).')
     parser.add_argument('--reference', nargs='?', const=REFERENCE_IMAGE, metavar='IMAGE',
