@@ -31,6 +31,23 @@ MIDDLE_GREY = 118
 DEFAULT_EXPOSURE_US = 20000     # capture.py's defaults when calibration.json has none
 DEFAULT_GAIN = 10.0
 
+# Brightness loop (fabric mean = mean intensity of the garment, 0-255)
+HIGH_BRIGHTNESS = 60            # fabric mean above this (and below MAX_BRIGHTNESS): the gain is right
+MAX_BRIGHTNESS = 200            # fabric mean at or above this: gain down one step
+MIN_BRIGHTNESS = 20             # fabric mean below this: gain up one step
+MIN_CONTRAST = 15               # final check: |C| below this, the last gain step is taken back
+GAIN_STEP = 1.0                 # dB on the Daheng camera
+GAIN_MIN = 0.0
+GAIN_MAX = 24.0
+MAX_PHOTOS = 12                 # photos in one run, the first one included
+
+# Waiting for a frame shot at new settings: the Daheng camera keeps delivering frames at the old
+# settings for a while (up to 1-2 s) after a change.
+SETTLE_S = 0.2                  # always wait this long first
+CHANGE_SEEN = 0.5               # a frame has moved this share of the expected change: it is new
+FALLBACK_WAIT_S = 1.0           # change too small or clipped to see: wait this long instead
+CHANGE_TIMEOUT_S = 6.0          # never wait longer than this
+
 
 def read_calibration(calibration_file):
     """calibration.json as a dict ({} when the file does not exist)."""
@@ -133,6 +150,151 @@ def measure_camera_garment(cam, pre):
         print('no garment found: %s' % '; '.join(res.problems))
         return None, None, None
     return values['contrast'], values['brightness'], values['exposure']
+
+
+def contrast_above_reference(contrast, reference):
+    """Flowchart: "Contrast above reference?"
+
+        |camera contrast| > |reference contrast|  -> True  (Yes: lock the exposure)
+        otherwise, or no garment (contrast None)  -> False (No: low-contrast exposure search)
+
+    The size only: a dark garment on a light table has a negative contrast, a light one on a dark
+    table a positive one, but both can stand out just as much.
+    """
+    if contrast is None:
+        return False
+    return abs(contrast) > abs(reference['contrast'])
+
+
+def frame_level(frame):
+    """Mean brightness of a frame (every 8th pixel)."""
+    return float(frame[::8, ::8].mean())
+
+
+def take_photo(cam, pre, exposure, gain):
+    """Set the exposure and gain, wait for a frame shot at them, and measure the garment.
+    Returns (contrast, brightness, exposure) like measure_camera_garment.
+
+    Brightness follows exposure and gain, so the expected level of the new frames is known. A frame
+    that has moved CHANGE_SEEN of the way towards it is shot at the new settings. When the change is
+    too small or clipped (near 0 or 255) to see, the frames after FALLBACK_WAIT_S are taken.
+    """
+    old_frame = cam.get_latest_image(copy=False)
+    old_exposure = cam.exposure or DEFAULT_EXPOSURE_US
+    old_gain = cam.gain if cam.gain is not None else gain
+
+    cam.set_exposure(exposure)
+    cam.set_gain(gain)
+
+    # the level the new frames should have (gain is in dB)
+    before, expected, visible = None, None, False
+    if old_frame is not None:
+        before = frame_level(old_frame)
+        ratio = (exposure / old_exposure) * 10 ** ((gain - old_gain) / 20)
+        expected = min(255.0, before * ratio)
+        visible = 3 < before < 250 and 3 < expected < 250 and abs(expected - before) >= 8
+
+    start = time.time()
+    time.sleep(SETTLE_S + exposure / 1e6)
+    while time.time() - start < CHANGE_TIMEOUT_S:
+        frame = cam.get_latest_image(copy=False)
+        if frame is not None and frame is not old_frame:      # a new frame
+            if visible:
+                if abs(frame_level(frame) - before) >= CHANGE_SEEN * abs(expected - before):
+                    break
+            elif time.time() - start >= FALLBACK_WAIT_S:
+                break
+        time.sleep(0.01)
+
+    contrast, brightness, stops = measure_camera_garment(cam, pre)
+    if contrast is None:
+        print('photo: %d us, gain %g -> no garment' % (exposure, gain))
+    else:
+        print('photo: %d us, gain %g -> contrast %.1f, brightness %.1f' % (exposure, gain, contrast, brightness))
+    return contrast, brightness, stops
+
+
+def brightness_loop(cam, pre, exposure, gain, contrast, brightness, photos):
+    """Flowchart: the brightness loop, with the exposure locked. Returns the gain to set.
+
+        fabric mean > 60 and < 200  -> stop here
+        fabric mean > 60 and >= 200 -> gain down one step, new photo, check again
+        fabric mean < 20            -> gain up one step, new photo, check again
+        fabric mean 20-60           -> final check: |C| < 15 -> the last gain step is taken back
+
+    It also stops (keeping the last good gain) when the gain reaches its limit, MAX_PHOTOS photos
+    are done, or a photo after a step has no garment.
+    """
+    previous_gain = None                        # the gain before the last step (None: no step yet)
+    while True:
+        if brightness > HIGH_BRIGHTNESS:
+            if brightness < MAX_BRIGHTNESS:
+                print('fabric mean %.1f is in %d-%d: gain %g' % (brightness, HIGH_BRIGHTNESS, MAX_BRIGHTNESS, gain))
+                return gain
+            step = -GAIN_STEP                   # fabric mean >= 200: gain down
+        elif brightness < MIN_BRIGHTNESS:
+            step = +GAIN_STEP                   # fabric mean < 20: gain up
+        else:
+            # final check
+            if abs(contrast) < MIN_CONTRAST and previous_gain is not None:
+                print('final check: |C| = %.1f < %d, gain back to %g' % (abs(contrast), MIN_CONTRAST, previous_gain))
+                return previous_gain
+            print('fabric mean %.1f, final check passed: gain %g' % (brightness, gain))
+            return gain
+
+        new_gain = min(GAIN_MAX, max(GAIN_MIN, gain + step))
+        if new_gain == gain:
+            print('gain at its limit (%g): stop' % gain)
+            return gain
+        if photos >= MAX_PHOTOS:
+            print('%d photos done: stop at gain %g' % (MAX_PHOTOS, gain))
+            return gain
+
+        new_contrast, new_brightness, _ = take_photo(cam, pre, exposure, new_gain)
+        photos += 1
+        if new_contrast is None:
+            print('no garment at gain %g: back to gain %g' % (new_gain, gain))
+            return gain
+        previous_gain, gain = gain, new_gain
+        contrast, brightness = new_contrast, new_brightness
+
+
+def set_and_save(cam, exposure, gain):
+    """Flowchart: "Set exposure and brightness". Sets them on the camera and writes them to
+    calibration.json ("exposure", "gain")."""
+    cam.set_exposure(exposure)
+    cam.set_gain(gain)
+    calibration = read_calibration(CALIBRATION_FILE)
+    calibration['exposure'] = exposure
+    calibration['gain'] = gain
+    write_calibration(calibration, CALIBRATION_FILE)
+    # the camera re-reads calibration.json when it changes; it already has these values
+    cam.last_config_mtime = os.path.getmtime(CALIBRATION_FILE)
+    print('set and saved: %d us, gain %g' % (exposure, gain))
+
+
+def run_auto_exposure(cam, pre):
+    """The flowchart from the top: photo at the reference's settings, contrast above the reference?
+    Yes: lock the exposure, brightness loop, set and save. No: not written yet."""
+    reference = load_reference(CALIBRATION_FILE)
+    if reference is None:
+        print('no reference in calibration.json: run  --reference  first')
+        return
+    exposure = float(reference['camera_exposure_us'])
+    gain = float(reference['camera_gain'])
+
+    # capture frame at reference settings; detect garment and ring, measure C and fabric mean
+    contrast, brightness, _ = take_photo(cam, pre, exposure, gain)
+    photos = 1
+
+    if not contrast_above_reference(contrast, reference):
+        print('contrast not above the reference: the low-contrast exposure search is not written yet')
+        return
+
+    # Yes: lock the exposure, then the brightness loop
+    print('contrast above the reference: exposure locked at %d us' % exposure)
+    gain = brightness_loop(cam, pre, exposure, gain, contrast, brightness, photos)
+    set_and_save(cam, exposure, gain)
 
 
 def main():
