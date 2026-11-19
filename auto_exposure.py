@@ -467,9 +467,10 @@ def main():
     try:
         run_auto_exposure(cam, pre)
 
-        # live view: a = run the auto exposure again, q = quit
-        print('a = run the auto exposure again, q = quit')
+        # live view: a = run the auto exposure again, o = toggle overlay, q = quit
+        print('a = run the auto exposure again, o = toggle overlay, q = quit')
         print('overlay: garment = green, ring = blue, outline = red')
+        show_overlay = True
 
         # background segmentation: runs every ~1 s so the window stays smooth
         _seg_lock = threading.Lock()
@@ -502,7 +503,7 @@ def main():
                 # overlay the latest segmentation result on the live frame
                 with _seg_lock:
                     seg = _seg_result[0]
-                if seg is not None:
+                if show_overlay and seg is not None:
                     seg_processed, res = seg
                     # draw_overlay expects BGR; re-use its masks (they were computed at same resolution)
                     view = draw_overlay(view, res)
@@ -525,6 +526,9 @@ def main():
                 cv2.imshow('auto exposure', cv2.resize(view, None, fx=scale, fy=scale))
 
             key = cv2.waitKey(30) & 0xFF
+            if key == ord('o'):
+                show_overlay = not show_overlay
+                print('overlay %s' % ('ON' if show_overlay else 'OFF'))
             if key == ord('a'):
                 _seg_stop[0] = True         # pause segmentation during the exposure run
                 seg_thread.join(timeout=2.0)
