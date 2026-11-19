@@ -497,10 +497,10 @@ def main():
     try:
         run_auto_exposure(cam, pre)
 
-        # live view: a = run the auto exposure again, o = toggle overlay, q = quit
-        print('a = run the auto exposure again, o = toggle overlay, q = quit')
+        # live view: a = run the auto exposure again, o = toggle overlay, s = save current frame, q = quit
+        print('a = run the auto exposure again, o = toggle overlay, s = save frame, q = quit')
         print('overlay: garment = green, ring = blue, outline = red')
-        show_overlay = True
+        show_overlay = SHOW_OVERLAY
 
         # background segmentation: runs every ~1 s so the window stays smooth
         _seg_lock = threading.Lock()
@@ -556,6 +556,23 @@ def main():
                 cv2.imshow('auto exposure', cv2.resize(view, None, fx=scale, fy=scale))
 
             key = cv2.waitKey(30) & 0xFF
+            if key == ord('s') and frame is not None:
+                captures_dir = os.path.join(HERE, 'captures')
+                os.makedirs(captures_dir, exist_ok=True)
+                ts = time.strftime('%Y%m%d_%H%M%S')
+                if show_overlay:
+                    save_path = os.path.join(captures_dir, 'capture_%s_overlay.jpg' % ts)
+                    clean_path = os.path.join(captures_dir, 'capture_%s_clean.jpg' % ts)
+                    cv2.imwrite(save_path, view)
+                    clean_bgr = cv2.cvtColor(processed, cv2.COLOR_RGB2BGR)
+                    cv2.imwrite(clean_path, clean_bgr)
+                    print('saved frame: %s' % save_path)
+                    print('saved clean: %s' % clean_path)
+                else:
+                    save_path = os.path.join(captures_dir, 'capture_%s.jpg' % ts)
+                    clean_bgr = cv2.cvtColor(processed, cv2.COLOR_RGB2BGR)
+                    cv2.imwrite(save_path, clean_bgr)
+                    print('saved frame: %s' % save_path)
             if key == ord('o'):
                 show_overlay = not show_overlay
                 print('overlay %s' % ('ON' if show_overlay else 'OFF'))
