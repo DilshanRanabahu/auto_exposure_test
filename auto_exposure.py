@@ -25,6 +25,7 @@ import argparse
 import json
 import math
 import os
+import threading
 import time
 
 import cv2  # type: ignore
@@ -468,16 +469,72 @@ def main():
 
         # live view: a = run the auto exposure again, q = quit
         print('a = run the auto exposure again, q = quit')
+        print('overlay: garment = green, ring = blue, outline = red')
+
+        # background segmentation: runs every ~1 s so the window stays smooth
+        _seg_lock = threading.Lock()
+        _seg_result = [None]        # [SeparationResult or None]
+        _seg_running = [False]
+        _seg_stop = [False]
+
+        def _seg_worker():
+            while not _seg_stop[0]:
+                frame = cam.get_latest_image()
+                if frame is not None:
+                    processed = pre.process_image(frame)
+                    edge_ok = pre.crop_bbox is not None
+                    res = separate_garment(processed, edge_ok=edge_ok)
+                    with _seg_lock:
+                        _seg_result[0] = (processed, res)
+                time.sleep(1.0)         # re-segment every second
+            _seg_running[0] = False
+
+        seg_thread = threading.Thread(target=_seg_worker, daemon=True)
+        seg_thread.start()
+        _seg_running[0] = True
+
         while True:
             frame = cam.get_latest_image()
             if frame is not None:
-                view = cv2.cvtColor(pre.process_image(frame), cv2.COLOR_RGB2BGR)   # Daheng frames are RGB
+                processed = pre.process_image(frame)
+                view = cv2.cvtColor(processed, cv2.COLOR_RGB2BGR)   # Daheng frames are RGB
+
+                # overlay the latest segmentation result on the live frame
+                with _seg_lock:
+                    seg = _seg_result[0]
+                if seg is not None:
+                    seg_processed, res = seg
+                    # draw_overlay expects BGR; re-use its masks (they were computed at same resolution)
+                    view = draw_overlay(view, res)
+                    # status text
+                    if res.valid:
+                        label = 'C=%.1f  %s' % (res.stats.get('contrast', 0), res.cue)
+                        color = (0, 220, 0)
+                    elif res.garment_mask is not None:
+                        label = 'NOT VALID: ' + ', '.join(res.problems[:2])
+                        color = (0, 140, 255)
+                    else:
+                        label = 'no garment: ' + ', '.join(res.problems[:2])
+                        color = (0, 0, 220)
+                    cv2.putText(view, label, (12, 36),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 0), 4, cv2.LINE_AA)
+                    cv2.putText(view, label, (12, 36),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.9, color,    2, cv2.LINE_AA)
+
                 scale = 1000 / max(view.shape[:2])
                 cv2.imshow('auto exposure', cv2.resize(view, None, fx=scale, fy=scale))
+
             key = cv2.waitKey(30) & 0xFF
             if key == ord('a'):
+                _seg_stop[0] = True         # pause segmentation during the exposure run
+                seg_thread.join(timeout=2.0)
                 run_auto_exposure(cam, pre)
+                # restart segmentation
+                _seg_stop[0] = False
+                seg_thread = threading.Thread(target=_seg_worker, daemon=True)
+                seg_thread.start()
             if key == ord('q'):
+                _seg_stop[0] = True
                 break
     finally:
         cam.stop()
