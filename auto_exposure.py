@@ -42,9 +42,8 @@ DEFAULT_EXPOSURE_US = 20000     # capture.py's defaults when calibration.json ha
 DEFAULT_GAIN = 10.0
 
 # Brightness loop (fabric mean = mean intensity of the garment, 0-255)
-HIGH_BRIGHTNESS = 60            # fabric mean above this (and below MAX_BRIGHTNESS): the gain is right
-MAX_BRIGHTNESS = 200            # fabric mean at or above this: gain down one step
-MIN_BRIGHTNESS = 20             # fabric mean below this: gain up one step
+MIN_BRIGHTNESS = 60             # fabric mean below this: garment too dark (cannot see seamlines), gain UP
+MAX_BRIGHTNESS = 200            # fabric mean at or above this: overexposed, gain DOWN
 MIN_CONTRAST = 15               # final check: |C| below this, the last gain step is taken back
 GAIN_STEP = 1.0                 # dB on the Daheng camera
 GAIN_MIN = 0.0
@@ -264,30 +263,24 @@ def brightness_loop(cam, pre, exposure, gain, contrast, brightness, photos):
     """Flowchart: the brightness loop, with the exposure locked. Returns (gain to set, contrast C
     measured at that gain).
 
-        fabric mean > 60 and < 200  -> stop here
-        fabric mean > 60 and >= 200 -> gain down one step, new photo, check again
-        fabric mean < 20            -> gain up one step, new photo, check again
-        fabric mean 20-60           -> final check: |C| < 15 -> the last gain step is taken back
+        fabric mean < 60             -> gain up one step (make dark garments bright enough to see seamlines)
+        fabric mean >= 200           -> gain down one step (prevent overexposure)
+        fabric mean in 60-200        -> target reached, stop
 
-    It also stops (keeping the last good gain) when the gain reaches its limit, MAX_PHOTOS photos
-    are done, or a photo after a step has no garment.
+    If after stepping up the contrast drops below MIN_CONTRAST (15) or garment is lost,
+    the last gain step is reverted.
     """
     previous_gain = None                        # the gain before the last step (None: no step yet)
     previous_contrast = None                    # the contrast at previous_gain
     while True:
-        if brightness > HIGH_BRIGHTNESS:
-            if brightness < MAX_BRIGHTNESS:
-                print('fabric mean %.1f is in %d-%d: gain %g' % (brightness, HIGH_BRIGHTNESS, MAX_BRIGHTNESS, gain))
-                return gain, contrast
+        if brightness < MIN_BRIGHTNESS:
+            step = +GAIN_STEP                   # fabric mean < 60: gain up to see seamlines
+            print('fabric mean %.1f < %d: gain up (+%g dB)' % (brightness, MIN_BRIGHTNESS, GAIN_STEP))
+        elif brightness >= MAX_BRIGHTNESS:
             step = -GAIN_STEP                   # fabric mean >= 200: gain down
-        elif brightness < MIN_BRIGHTNESS:
-            step = +GAIN_STEP                   # fabric mean < 20: gain up
+            print('fabric mean %.1f >= %d: gain down (-%g dB)' % (brightness, MAX_BRIGHTNESS, GAIN_STEP))
         else:
-            # final check
-            if abs(contrast) < MIN_CONTRAST and previous_gain is not None:
-                print('final check: |C| = %.1f < %d, gain back to %g' % (abs(contrast), MIN_CONTRAST, previous_gain))
-                return previous_gain, previous_contrast
-            print('fabric mean %.1f, final check passed: gain %g' % (brightness, gain))
+            print('fabric mean %.1f is in %d-%d: gain %g' % (brightness, MIN_BRIGHTNESS, MAX_BRIGHTNESS, gain))
             return gain, contrast
 
         new_gain = min(GAIN_MAX, max(GAIN_MIN, gain + step))
@@ -303,6 +296,12 @@ def brightness_loop(cam, pre, exposure, gain, contrast, brightness, photos):
         if new_contrast is None:
             print('no garment at gain %g: back to gain %g' % (new_gain, gain))
             return gain, contrast
+
+        # Final check: if stepping up caused contrast to drop below threshold, revert
+        if step > 0 and new_contrast < MIN_CONTRAST and previous_gain is not None:
+            print('final check: contrast %.1f < %d after gain up, back to gain %g' % (new_contrast, MIN_CONTRAST, gain))
+            return gain, contrast
+
         previous_gain, gain = gain, new_gain
         previous_contrast = contrast
         contrast, brightness = new_contrast, new_brightness
