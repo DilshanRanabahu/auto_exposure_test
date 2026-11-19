@@ -65,6 +65,9 @@ CHANGE_SEEN = 0.5               # a frame has moved this share of the expected c
 FALLBACK_WAIT_S = 1.0           # change too small or clipped to see: wait this long instead
 CHANGE_TIMEOUT_S = 6.0          # never wait longer than this
 
+# Live view
+SHOW_OVERLAY = True             # show segmentation overlay on startup (toggle with 'o')
+
 
 def read_calibration(calibration_file):
     """calibration.json as a dict ({} when the file does not exist)."""
@@ -381,6 +384,33 @@ def set_and_save(cam, exposure, gain):
     print('set and saved: %d us, gain %g' % (exposure, gain))
 
 
+def save_final_capture(cam, pre, exposure, gain):
+    """Save the final frame and its overlay to captures/ after auto exposure values are set."""
+    time.sleep(0.3)
+    frame = cam.get_latest_image()
+    if frame is None:
+        return
+    processed = pre.process_image(frame)
+    bgr = cv2.cvtColor(processed, cv2.COLOR_RGB2BGR)
+
+    captures_dir = os.path.join(HERE, 'captures')
+    os.makedirs(captures_dir, exist_ok=True)
+    ts = time.strftime('%Y%m%d_%H%M%S')
+    base_name = 'ae_%s_%dus_gain%g' % (ts, int(exposure), gain)
+
+    raw_path = os.path.join(captures_dir, '%s.jpg' % base_name)
+    cv2.imwrite(raw_path, bgr)
+
+    edge_ok = pre.crop_bbox is not None
+    res = separate_garment(processed, edge_ok=edge_ok)
+    overlay = draw_overlay(bgr, res)
+    overlay_path = os.path.join(captures_dir, '%s_overlay.jpg' % base_name)
+    cv2.imwrite(overlay_path, overlay)
+
+    print('saved image  : %s' % raw_path)
+    print('saved overlay: %s' % overlay_path)
+
+
 def print_result(exposure, gain, contrast, saved, seconds):
     """The values set at the end of a run, the garment's contrast C at them (None: not found) and
     the time the whole run took."""
@@ -442,6 +472,7 @@ def run_auto_exposure(cam, pre):
     print('exposure locked at %d us' % exposure)
     gain, contrast = brightness_loop(cam, pre, exposure, gain, contrast, brightness, photos)
     set_and_save(cam, exposure, gain)
+    save_final_capture(cam, pre, exposure, gain)
     print_result(exposure, gain, contrast, True, time.time() - start)
 
 
