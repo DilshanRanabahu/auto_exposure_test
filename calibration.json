@@ -183,7 +183,7 @@
     "reference_image": {
         "brightness": 71.5,
         "exposure": -0.72,
-        "contrast": -183.5,
+        "contrast": 183.5,
         "image": "image.png",
         "camera_exposure_us": 25000.0,
         "camera_gain": 12.0,

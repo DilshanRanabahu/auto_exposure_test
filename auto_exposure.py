@@ -94,7 +94,7 @@ def garment_values(gray, garment_mask, ring_mask):
     return {
         'brightness': round(garment_mean, 1),
         'exposure': round(math.log2(max(garment_mean, 1.0) / MIDDLE_GREY), 2),
-        'contrast': round(garment_mean - ring_mean, 1),
+        'contrast': round(abs(garment_mean - ring_mean), 1),
     }
 
 
@@ -343,7 +343,7 @@ def low_contrast_search(cam, pre, exposure, gain, photos):
         # measure C, fabric mean and table mean on the saved mask
         fabric = float(gray[garment_mask > 0].mean())
         table = float(gray[ring_mask > 0].mean())
-        contrast = fabric - table
+        contrast = abs(fabric - table)
         print('  saved mask at %d us: C %.1f, fabric %.1f, table %.1f' % (exposure, contrast, fabric, table))
 
         if abs(contrast) >= MIN_CONTRAST:
