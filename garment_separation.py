@@ -70,7 +70,7 @@ MIN_CANDIDATE_FRAC = 0.015      # select_garment: an object smaller than this is
 MAX_PICK_SIDE_CONTACT = 0.15    # select_garment: an object along more of one frame side than this is the room
 MIN_AREA_FRAC = 0.04            # a garment covers at least this much of the frame...
 MAX_AREA_FRAC = 0.90            # ...and at most this much (the matcher uses the same 4-90 %)
-MIN_CONTRAST = 15               # grey levels between garment and ring for a result to count as separated
+MIN_CONTRAST = 6                # grey levels between garment and ring for a result to count as separated (white garments reach 6-10)
 MAX_BORDER_CONTACT = 0.25       # a garment covering more of the frame's edge than this has run into the table
 MAX_SIDE_CONTACT = 0.50         # ...or more of any one side than this has joined something lying along it
 
