@@ -45,8 +45,8 @@ DEFAULT_GAIN = 10.0
 MIN_BRIGHTNESS = 60             # fabric mean below this: garment too dark (cannot see seamlines), gain UP
 MAX_BRIGHTNESS = 200            # fabric mean at or above this: overexposed, gain DOWN
 MIN_CONTRAST = 6                # final check & binary search target (white garments reach 6-10 contrast against white table)
-GAIN_STEP = 1.0                 # dB on the Daheng camera
-GAIN_MIN = 0.0
+GAIN_STEP = 2.0                 # dB on the Daheng camera
+GAIN_MIN = 2.0
 GAIN_MAX = 24.0
 MAX_PHOTOS = 12                 # photos in one run, the first one included
 
