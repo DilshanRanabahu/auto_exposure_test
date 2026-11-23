@@ -30,29 +30,11 @@ so fewer photos means a faster run.
 
 ## How it works
 
-```mermaid
-flowchart TD
-  A["1. Photo at the reference settings"] --> B["2. Find garment + ring once, save the masks<br>measure C, F, T"]
-  B --> D{"3. C above the reference?"}
-  D -- Yes --> L["Lock exposure"]
-  D -- No --> N0{"Garment found?"}
-  N0 -- No --> H["Exposure x 0.5, new photo, find the garment again"] --> N0
-  N0 -- Yes --> N1{"4. C >= 6 ?"}
-  N1 -- Yes --> L
-  N1 -- No --> N2{"Clipped?<br>max(F, T) > 200"}
-  N2 -- Yes --> N3["Exposure x 0.5, new photo"] --> N1
-  N2 -- No --> N4["Calculate:<br>E_need = E x 6 x 1.3 / C<br>E_clip = E x 200 / max(F, T)"]
-  N4 --> N5{"Can C reach 6<br>before clipping?"}
-  N5 -- No --> FLAG(["Stop and flag the operator"])
-  N5 -- Yes --> N6["New photo at min(E_need, E_clip)<br>measure on the saved masks"] --> N1
-  L --> G1{"5. F between 60 and 200 ?"}
-  G1 -- Yes --> S["6. Set and save to calibration.json"]
-  G1 -- No --> G2["Calculate gain:<br>gain + 20 x log10(120 / F)<br>new photo"]
-  G2 --> G3{"C < 6 now?"}
-  G3 -- Yes --> G4["Put the old gain back"] --> S
-  G3 -- No --> S
-  S --> STOP(["Stop"])
-```
+![Auto exposure flowchart](docs/flowchart.png)
+
+This is the original flowchart. The code follows it, but calculates the exposure and the gain instead of
+stepping ("exposure +/- step, halve the step", "brightness up/down one step"), and uses C >= 6 instead of 15.
+The steps below describe what the code does.
 
 ### Step by step
 
